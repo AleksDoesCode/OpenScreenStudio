@@ -33,6 +33,7 @@ const LS = {
   cameraId: "oss.capture.cameraId",
   micId: "oss.capture.micId",
   countdownSecs: "oss.capture.countdownSecs",
+  framerate: "oss.capture.framerate",
 };
 
 export const COUNTDOWN_OPTIONS = [0, 3, 5, 10] as const;
@@ -42,6 +43,15 @@ const DEFAULT_COUNTDOWN_SECS = 3;
 export const getCountdownSecs = () => {
   const v = Number(lsGet(LS.countdownSecs));
   return (COUNTDOWN_OPTIONS as readonly number[]).includes(v) ? v : DEFAULT_COUNTDOWN_SECS;
+};
+
+export const FRAMERATE_OPTIONS = [30, 60] as const;
+const DEFAULT_FRAMERATE = 30;
+
+// Shared with the HUD window so start_capture uses the persisted choice.
+export const getFramerate = () => {
+  const v = Number(lsGet(LS.framerate));
+  return (FRAMERATE_OPTIONS as readonly number[]).includes(v) ? v : DEFAULT_FRAMERATE;
 };
 
 const lsGet = (k: string) => {
@@ -145,6 +155,7 @@ export function CaptureHUD({
   const [cameraId, setCameraId] = useState(() => lsGet(LS.cameraId) ?? "");
   const [micId, setMicId] = useState(() => lsGet(LS.micId) ?? "");
   const [countdownSecs, setCountdownSecs] = useState(getCountdownSecs);
+  const [framerate, setFramerate] = useState(getFramerate);
   const [enumError, setEnumError] = useState<string | null>(null);
   const [permHint, setPermHint] = useState<
     { text: string; pane: "camera" | "microphone" | "screen" } | null
@@ -297,7 +308,21 @@ export function CaptureHUD({
         ),
       );
       const countdown = await Submenu.new({ text: "Countdown", items: countdownItems });
-      const menu = await Menu.new({ items: [countdown] });
+      const framerateItems = await Promise.all(
+        FRAMERATE_OPTIONS.map((f) =>
+          CheckMenuItem.new({
+            id: `framerate-${f}`,
+            text: `${f} FPS`,
+            checked: f === framerate,
+            action: () => {
+              setFramerate(f);
+              lsSet(LS.framerate, String(f));
+            },
+          }),
+        ),
+      );
+      const frameRate = await Submenu.new({ text: "Frame Rate", items: framerateItems });
+      const menu = await Menu.new({ items: [countdown, frameRate] });
       await menu.popup();
     } catch (e) {
       setEnumError(String(e));

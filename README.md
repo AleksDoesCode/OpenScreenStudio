@@ -157,9 +157,12 @@ Shipped:
 - ✅ System-audio capture.
 - ✅ Real export pipeline — offline frame-by-frame compositing to mp4 / gif, to file or clipboard.
 - ✅ Timeline editing with per-track audio (mic / system) and auto-zoom segments.
+- ✅ 30 / 60 FPS capture selection in the HUD gear menu.
+- ✅ Per-track auto level ("Studio sound") applied to preview playback and export.
 
 Planned:
 
+- AI captions and transcripts.
 - Richer timeline effects (transitions, multi-clip trimming).
 - Apple notarization for friction-free installs.
 

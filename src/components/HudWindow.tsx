@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
-import { CaptureHUD, getCountdownSecs, type CaptureAVSettings } from "./CaptureHUD";
+import { CaptureHUD, getFramerate, getCountdownSecs, type CaptureAVSettings } from "./CaptureHUD";
 import { HudIco } from "./hudIcons";
 import { native, type CaptureArtifact, type CropRect } from "../lib/native";
 
@@ -237,7 +237,7 @@ export function HudWindow() {
         systemAudio: pending.av.systemAudio,
         micDeviceId: pending.av.micDeviceId,
         cameraDeviceId: pending.av.cameraDeviceId,
-        framerate: 30,
+        framerate: getFramerate(),
         crop: pending.crop,
       });
       setRecStart(Date.now());

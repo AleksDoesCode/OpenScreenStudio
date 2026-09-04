@@ -161,7 +161,7 @@ scripts/fetch-ffmpeg.sh         downloads the platform ffmpeg binaries (run on p
 ## Future capture upgrades
 
 - **Device capture mode.** The HUD's "Device" mode button exists but is disabled.
-- **More gear-menu settings.** The settings menu currently has only the Countdown submenu; new app-level settings belong there (`openSettingsMenu` in `CaptureHUD.tsx`).
+- **More gear-menu settings.** The settings menu currently has Countdown and Frame Rate (30/60 FPS, persisted as `oss.capture.framerate`; `start_capture` already honors `args.framerate`); new app-level settings belong there (`openSettingsMenu` in `CaptureHUD.tsx`).
 - **Drop the bundled ffmpeg** by doing segment concat and export encoding through AVFoundation/VideoToolbox instead.
 
 ## Verification before declaring done

@@ -304,7 +304,8 @@ pub struct AudioTrackSpec {
 /// inputs are assumed to start at ffmpeg input index 1 (input 0 is the
 /// video). Per track: cut its window, rebase timestamps, apply gain, then
 /// delay it to its position in the exported timeline; mix all tracks without
-/// normalization (each keeps its set level).
+/// normalization (each keeps its set level). Gain may exceed unity — the
+/// editor's auto-level ("Studio sound") lifts quiet tracks past 1.0.
 pub(crate) fn append_audio_mix_args(args: &mut Vec<String>, audio_tracks: &[AudioTrackSpec]) {
     let mut fc = String::new();
     for (i, t) in audio_tracks.iter().enumerate() {
@@ -314,7 +315,9 @@ pub(crate) fn append_audio_mix_args(args: &mut Vec<String>, audio_tracks: &[Audi
             input = i + 1,
             s0 = t.src_start.max(0.0),
             s1 = t.src_end.max(t.src_start),
-            g = t.gain.clamp(0.0, 1.0),
+            // Unity-plus gains come from the editor's auto-level feature; the
+            // ffmpeg volume filter accepts them — soft-clipping risk is on the user.
+            g = t.gain.clamp(0.0, 8.0),
             d = delay_ms,
         ));
     }

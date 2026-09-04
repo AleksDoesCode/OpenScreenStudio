@@ -166,6 +166,8 @@ type AudioTrackState = {
   gain: number; // 0..1
   trimStart: number;
   trimEnd: number;
+  /** Studio-sound style auto leveling (peak-normalized at decode time). */
+  normalize: boolean;
 };
 
 type AudioTrackKey = "system" | "mic";
@@ -175,6 +177,7 @@ const defaultAudioTrack = (): AudioTrackState => ({
   gain: 1,
   trimStart: 0,
   trimEnd: 0,
+  normalize: false,
 });
 
 const defaultAudioTracks = () => ({
@@ -306,6 +309,35 @@ function peaksFromBuffer(audio: AudioBuffer, n = 260): number[] | null {
     if (m > peak) peak = m;
   }
   return peak > 0.001 ? out.map((v) => v / peak) : null;
+}
+
+/**
+ * Auto level ("Studio sound"): multiplier that lifts a track's loudest peak
+ * toward ~95% full scale, cutting hot tracks down as well. The boost is
+ * capped so quiet-room noise floors don't get amplified with the voice.
+ */
+const AUTO_LEVEL_TARGET = 0.95;
+const AUTO_LEVEL_MAX_BOOST = 6;
+
+function autoLevelGain(audio: AudioBuffer): number {
+  let peak = 0;
+  for (let ch = 0; ch < audio.numberOfChannels; ch++) {
+    const data = audio.getChannelData(ch);
+    // Stride-sample ~200k points max per channel — plenty for a peak estimate.
+    const stride = Math.max(1, Math.floor(data.length / 200_000));
+    for (let i = 0; i < data.length; i += stride) {
+      const a = Math.abs(data[i]!);
+      if (a > peak) peak = a;
+    }
+  }
+  if (!isFinite(peak) || peak <= 0.01) return 1; // effectively silent: leave it
+  return Math.min(AUTO_LEVEL_MAX_BOOST, AUTO_LEVEL_TARGET / peak);
+}
+
+/** User gain scaled by the auto-level multiplier (bounded for ffmpeg). */
+function exportTrackGain(t: AudioTrackState, boost: number): number {
+  const g = t.gain * (t.normalize ? boost : 1);
+  return Math.max(0, Math.min(AUTO_LEVEL_MAX_BOOST, g));
 }
 
 const THEME_OPTIONS: { value: ThemeMode; label: string }[] = [
@@ -1207,6 +1239,28 @@ function AudioPanel({
             max={100}
             onReset={() => onChange(row.key, { gain: 1 })}
           />
+          <div className="label-row label-strong" style={{ marginTop: 14 }}>
+            Auto level
+          </div>
+          <div className="seg">
+            <button
+              className={!row.track.normalize ? "on" : ""}
+              onClick={() => onChange(row.key, { normalize: false })}
+            >
+              Off
+            </button>
+            <button
+              className={row.track.normalize ? "on" : ""}
+              onClick={() => onChange(row.key, { normalize: true })}
+            >
+              On
+            </button>
+          </div>
+          <div className="helper-text" style={{ marginTop: 6 }}>
+            {row.track.normalize
+              ? `Leveling to ~${Math.round(AUTO_LEVEL_TARGET * 100)}% peak · applying ×${row.autoGain.toFixed(2)} to this track.`
+              : "Lifts quiet audio and tames loud peaks toward a consistent level."}
+          </div>
           {(row.track.trimStart > 0 || row.track.trimEnd > 0) && (
             <div
               className="helper-text"
@@ -2385,6 +2439,8 @@ type AudioRowInfo = {
   label: string;
   peaks: number[] | null;
   track: AudioTrackState;
+  /** Auto-level multiplier currently computed from the decoded track. */
+  autoGain: number;
 };
 
 const AUDIO_ROW_H = 36;
@@ -3735,8 +3791,26 @@ export function Editor({
   // play/seek (re)starts an AudioBufferSourceNode at the video's time, and a
   // rAF watcher applies mute/trim/gain and restarts a source if it drifts.
   // The tracks' editable state rides a ref so the loop is subscription-free.
-  const audioSyncRef = useRef({ tracks: state.audioTracks, duration });
-  audioSyncRef.current = { tracks: state.audioTracks, duration };
+  // Auto-level multipliers, recomputed when a sidecar buffer decodes.
+  const systemAutoGain = useMemo(
+    () => (systemBuf ? autoLevelGain(systemBuf) : 1),
+    [systemBuf],
+  );
+  const micAutoGain = useMemo(
+    () => (micBuf ? autoLevelGain(micBuf) : 1),
+    [micBuf],
+  );
+
+  const audioSyncRef = useRef({
+    tracks: state.audioTracks,
+    duration,
+    auto: { system: 1, mic: 1 },
+  });
+  audioSyncRef.current = {
+    tracks: state.audioTracks,
+    duration,
+    auto: { system: systemAutoGain, mic: micAutoGain },
+  };
 
   useEffect(() => {
     const v = videoRef.current;
@@ -3802,13 +3876,14 @@ export function Editor({
 
     let raf = 0;
     const tick = () => {
-      const { tracks, duration: dur } = audioSyncRef.current;
+      const { tracks, duration: dur, auto } = audioSyncRef.current;
       const t = v.currentTime;
       for (const n of nodes) {
         const ts = tracks[n.key];
         const inWindow = t >= ts.trimStart - 1e-3 && t <= dur - ts.trimEnd + 1e-3;
+        const boost = ts.normalize ? auto[n.key] : 1;
         n.gain.gain.value =
-          ts.muted || !inWindow ? 0 : Math.max(0, Math.min(1, ts.gain));
+          ts.muted || !inWindow ? 0 : Math.max(0, Math.min(1, ts.gain)) * boost;
         if (!v.paused && n.src) {
           const expected = n.startOffset + (ctx.currentTime - n.startCtxT);
           if (Math.abs(expected - t) > 0.12) startNode(n, t);
@@ -4077,7 +4152,14 @@ export function Editor({
     setState((s) => ({
       ...s,
       ...project.editorState,
-      audioTracks: project.editorState.audioTracks ?? defaultAudioTracks(),
+      // Merge over defaults so tracks saved before `normalize` existed load valid.
+      audioTracks: {
+        system: {
+          ...defaultAudioTrack(),
+          ...(project.editorState.audioTracks?.system ?? {}),
+        },
+        mic: { ...defaultAudioTrack(), ...(project.editorState.audioTracks?.mic ?? {}) },
+      },
       camera: project.editorState.camera
         ? { ...defaultCameraState(), ...project.editorState.camera }
         : defaultCameraState(),
@@ -4103,13 +4185,13 @@ export function Editor({
   const audioRows = useMemo<AudioRowInfo[]>(() => {
     const rows: AudioRowInfo[] = [];
     if (systemAudioSrc) {
-      rows.push({ key: "system", label: "System audio", peaks: systemPeaks, track: state.audioTracks.system });
+      rows.push({ key: "system", label: "System audio", peaks: systemPeaks, track: state.audioTracks.system, autoGain: systemAutoGain });
     }
     if (micAudioSrc) {
-      rows.push({ key: "mic", label: "Microphone", peaks: micPeaks, track: state.audioTracks.mic });
+      rows.push({ key: "mic", label: "Microphone", peaks: micPeaks, track: state.audioTracks.mic, autoGain: micAutoGain });
     }
     return rows;
-  }, [systemAudioSrc, micAudioSrc, systemPeaks, micPeaks, state.audioTracks]);
+  }, [systemAudioSrc, micAudioSrc, systemPeaks, micPeaks, state.audioTracks, systemAutoGain, micAutoGain]);
 
   const selectAudioTrack = (key: AudioTrackKey | null) => {
     setSelectedAudioKey(key);
@@ -4394,10 +4476,25 @@ export function Editor({
             trimEnd={state.trimEnd}
             audioTracks={[
               ...(artifact.systemAudioPath
-                ? [{ path: artifact.systemAudioPath, ...state.audioTracks.system }]
+                ? [
+                    {
+                      path: artifact.systemAudioPath,
+                      ...state.audioTracks.system,
+                      gain: exportTrackGain(
+                        state.audioTracks.system,
+                        systemAutoGain,
+                      ),
+                    },
+                  ]
                 : []),
               ...(artifact.micPath
-                ? [{ path: artifact.micPath, ...state.audioTracks.mic }]
+                ? [
+                    {
+                      path: artifact.micPath,
+                      ...state.audioTracks.mic,
+                      gain: exportTrackGain(state.audioTracks.mic, micAutoGain),
+                    },
+                  ]
                 : []),
             ]}
             camera={
