@@ -87,6 +87,7 @@ src/
   lib/
     native.ts                   typed Tauri command wrappers + listen helpers + sidecar types
     autoZoom.ts                 derive zoom segments from cursor-sidecar clicks
+    effects.ts                  plugin registry + timeline effect segments (color grade/vignette/grain/glow)
   styles/
     globals.css                 design system (~2100 lines, ported from the handoff)
     tokens.css                  CSS custom properties / design tokens
@@ -136,6 +137,7 @@ scripts/fetch-ffmpeg.sh         downloads the platform ffmpeg binaries (run on p
 - **Frontend ↔ Rust bridge** — [`src/lib/native.ts`](src/lib/native.ts). The `native` object wraps every command; listen helpers: `onMicLevel`, `onRecordingArtifact`, `onRecordingStoppedExternally`, `onPickerSelected`, `onPickerState`, `onPickerHover`, `onMenuSaveProject`, `onMenuOpenProject`. Cursor-sidecar TypeScript types (`CursorSidecar`, `CursorSidecarShapeName`, …) live here too. Add new commands here, keep return types narrow.
 - **Editor** — [`src/components/Editor/index.tsx`](src/components/Editor/index.tsx). The largest component. Owns video playback, timeline scrubbing, auto-zoom segments (via `lib/autoZoom.ts` + the cursor sidecar), the cursor overlay, preview-quality settings, and project save/open.
 - **Auto-zoom** — [`src/lib/autoZoom.ts`](src/lib/autoZoom.ts). Pure logic: derives `ZoomSegment`s from sidecar clicks; the editor renders/edits them.
+- **Plugin-based timeline video effects** — [`src/lib/effects.ts`](src/lib/effects.ts) is the plugin registry: each `EffectPluginDef` (Black & White, Sepia, Vintage Film, Vignette, Warm Glow, Cool Tone, Dreamy Soft, High Contrast, Film Grain, Invert Flash, …) declares only the `PostFxParams` keys it changes at full strength (brightness/contrast/saturation/temperature/hueRotate/sepia/invert/vignette/grain/blur — the param set lives in `lib/compositor.ts`); adding a look is one registry entry, no renderer changes. `EffectSegment`s place a plugin + 0–1 intensity over a time range on the timeline's Effects track (mirrors `ZoomSegment`, own crossfade at segment edges). `resolveEffectParams(tMs, segments)` blends the active segment toward neutral; `renderFrame` (Canvas2D) and `GLCompositor.render()` (WebGL, via an offscreen FBO + fullscreen grading shader) both apply the *same* resolved params as the last compositing step, so preview and export match. The DOM (non-GL) preview fallback applies only the CSS-filter-representable subset (`postFxCssFilter`) directly to the recorded-window element.
 - **Design system** — [`src/styles/globals.css`](src/styles/globals.css) and [`tokens.css`](src/styles/tokens.css) are the single source of truth for colors, spacing, and component classes. **Do not** restyle components inline; reuse existing class names.
 - **Accent presets** — [`src/hooks/useAccent.ts`](src/hooks/useAccent.ts). Adds `--accent`, `--accent-vibrant`, `--accent-shadow`, `--accent-foreground` to `:root`.
 

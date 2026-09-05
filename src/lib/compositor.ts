@@ -557,6 +557,229 @@ export type CameraRenderOpts = {
   mirrored: boolean;
 };
 
+// ---------------------------------------------------------------------------
+// Post effects — a whole-frame color/stylize pass driven by the timeline's
+// plugin-based effect segments (see lib/effects.ts for the plugin registry
+// and segment resolution). Applied identically here (Canvas2D) and in
+// compositorGL (GPU) as the last step of renderFrame, after the wallpaper,
+// video, cursor, and camera layers are composited — so a plugin's look
+// (grade + vignette + grain + glow) reads as one coherent shot.
+// ---------------------------------------------------------------------------
+
+export type PostFxParams = {
+  /** 1 = neutral. */
+  brightness: number;
+  /** 1 = neutral. */
+  contrast: number;
+  /** 1 = neutral, 0 = grayscale. */
+  saturation: number;
+  /** -1 (cool/blue) .. 1 (warm/orange), 0 = neutral. */
+  temperature: number;
+  hueRotateDeg: number;
+  /** 0..1. */
+  sepia: number;
+  /** 0..1. */
+  invert: number;
+  /** 0..1 vignette strength. */
+  vignette: number;
+  /** 0..1 — how far the vignette's dark ring reaches toward the center. */
+  vignetteSoftness: number;
+  /** 0..1 animated film-grain amount. */
+  grain: number;
+  /** Soft-focus/glow blur, in layout px. */
+  blur: number;
+};
+
+export const NEUTRAL_POST_FX: PostFxParams = {
+  brightness: 1,
+  contrast: 1,
+  saturation: 1,
+  temperature: 0,
+  hueRotateDeg: 0,
+  sepia: 0,
+  invert: 0,
+  vignette: 0,
+  vignetteSoftness: 0.5,
+  grain: 0,
+  blur: 0,
+};
+
+const POST_FX_EPS = 1e-3;
+
+/** True when `p` would visibly change nothing — callers skip the extra pass. */
+export function isNeutralPostFx(p: PostFxParams | null | undefined): boolean {
+  if (!p) return true;
+  return (
+    Math.abs(p.brightness - 1) < POST_FX_EPS &&
+    Math.abs(p.contrast - 1) < POST_FX_EPS &&
+    Math.abs(p.saturation - 1) < POST_FX_EPS &&
+    Math.abs(p.temperature) < POST_FX_EPS &&
+    Math.abs(p.hueRotateDeg) < POST_FX_EPS &&
+    p.sepia < POST_FX_EPS &&
+    p.invert < POST_FX_EPS &&
+    p.vignette < POST_FX_EPS &&
+    p.grain < POST_FX_EPS &&
+    p.blur < POST_FX_EPS
+  );
+}
+
+/**
+ * Blend a plugin's full-strength `target` params toward neutral by `amount`
+ * (0..1). Plugins only declare the keys that differ from neutral at full
+ * strength (see lib/effects.ts); this is the generic engine that scales
+ * that look by the segment's intensity/crossfade weight.
+ */
+export function mixPostFx(
+  target: Partial<PostFxParams>,
+  amount: number,
+): PostFxParams {
+  const t = Math.max(0, Math.min(1, amount));
+  const full = { ...NEUTRAL_POST_FX, ...target };
+  const out = {} as PostFxParams;
+  (Object.keys(NEUTRAL_POST_FX) as (keyof PostFxParams)[]).forEach((k) => {
+    out[k] = NEUTRAL_POST_FX[k] + (full[k] - NEUTRAL_POST_FX[k]) * t;
+  });
+  return out;
+}
+
+function cssFilterString(p: PostFxParams, s: number): string {
+  const parts: string[] = [];
+  if (p.blur > POST_FX_EPS) parts.push(`blur(${(p.blur * s).toFixed(2)}px)`);
+  if (Math.abs(p.brightness - 1) > POST_FX_EPS)
+    parts.push(`brightness(${p.brightness.toFixed(3)})`);
+  if (Math.abs(p.contrast - 1) > POST_FX_EPS)
+    parts.push(`contrast(${p.contrast.toFixed(3)})`);
+  if (Math.abs(p.saturation - 1) > POST_FX_EPS)
+    parts.push(`saturate(${p.saturation.toFixed(3)})`);
+  if (p.sepia > POST_FX_EPS)
+    parts.push(`sepia(${Math.min(1, p.sepia).toFixed(3)})`);
+  if (Math.abs(p.hueRotateDeg) > POST_FX_EPS)
+    parts.push(`hue-rotate(${p.hueRotateDeg.toFixed(2)}deg)`);
+  if (p.invert > POST_FX_EPS)
+    parts.push(`invert(${Math.min(1, p.invert).toFixed(3)})`);
+  return parts.length ? parts.join(" ") : "none";
+}
+
+/** DOM (CSS) equivalent of `cssFilterString`, for the non-GL preview path. */
+export function postFxCssFilter(p: PostFxParams): string {
+  return isNeutralPostFx(p) ? "none" : cssFilterString(p, 1);
+}
+
+// Deterministic hash → [0,1). Seeds the animated grain from `timeMs` so the
+// editor preview and the offline exporter draw the *same* grain per frame.
+function hash01(n: number): number {
+  const x = Math.sin(n * 12.9898) * 43758.5453;
+  return x - Math.floor(x);
+}
+
+let grainTileCanvas: HTMLCanvasElement | null = null;
+const GRAIN_TILE = 128;
+function getGrainTile(): HTMLCanvasElement {
+  if (grainTileCanvas) return grainTileCanvas;
+  const c = document.createElement("canvas");
+  c.width = c.height = GRAIN_TILE;
+  const cx = c.getContext("2d");
+  if (cx) {
+    const img = cx.createImageData(GRAIN_TILE, GRAIN_TILE);
+    for (let i = 0; i < img.data.length; i += 4) {
+      const v = Math.floor(Math.random() * 255);
+      img.data[i] = v;
+      img.data[i + 1] = v;
+      img.data[i + 2] = v;
+      img.data[i + 3] = 255;
+    }
+    cx.putImageData(img, 0, 0);
+  }
+  grainTileCanvas = c;
+  return c;
+}
+
+// Each destination context gets its own persistent scratch canvas (resized
+// in place) so post-fx frames don't allocate a new canvas every draw.
+const postFxScratches = new WeakMap<CanvasRenderingContext2D, HTMLCanvasElement>();
+function getPostFxScratch(
+  destCtx: CanvasRenderingContext2D,
+  w: number,
+  h: number,
+): CanvasRenderingContext2D {
+  let c = postFxScratches.get(destCtx);
+  if (!c) {
+    c = document.createElement("canvas");
+    postFxScratches.set(destCtx, c);
+  }
+  if (c.width !== w || c.height !== h) {
+    c.width = w;
+    c.height = h;
+  }
+  const cx = c.getContext("2d");
+  if (!cx) throw new Error("Could not create post-fx scratch canvas context");
+  return cx;
+}
+
+/**
+ * Composite the fully-rendered `src` frame onto `ctx`, applying the post-fx
+ * stack: CSS filters (blur/brightness/contrast/saturate/sepia/hue-rotate/
+ * invert), then a warm/cool temperature tint, a vignette, and animated film
+ * grain — in that order, mirroring the GPU shader in compositorGL.
+ */
+function applyPostFx2D(
+  ctx: CanvasRenderingContext2D,
+  src: CanvasImageSource,
+  outW: number,
+  outH: number,
+  s: number,
+  p: PostFxParams,
+  timeMs: number,
+) {
+  ctx.save();
+  ctx.filter = cssFilterString(p, s);
+  ctx.drawImage(src, 0, 0, outW, outH);
+  ctx.filter = "none";
+  if (Math.abs(p.temperature) > POST_FX_EPS) {
+    ctx.globalCompositeOperation = "overlay";
+    ctx.globalAlpha = Math.min(1, Math.abs(p.temperature)) * 0.25;
+    ctx.fillStyle = p.temperature > 0 ? "#ff9a3c" : "#3ca0ff";
+    ctx.fillRect(0, 0, outW, outH);
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = "source-over";
+  }
+  if (p.vignette > POST_FX_EPS) {
+    const soft = 0.15 + p.vignetteSoftness * 0.65;
+    const outerR = Math.hypot(outW, outH) / 2;
+    const innerR = outerR * (1 - soft) * (1 - p.vignette * 0.35);
+    const grad = ctx.createRadialGradient(
+      outW / 2,
+      outH / 2,
+      Math.max(0, innerR),
+      outW / 2,
+      outH / 2,
+      outerR,
+    );
+    grad.addColorStop(0, "rgba(0,0,0,0)");
+    grad.addColorStop(1, `rgba(0,0,0,${Math.min(1, p.vignette)})`);
+    ctx.globalCompositeOperation = "multiply";
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, outW, outH);
+    ctx.globalCompositeOperation = "source-over";
+  }
+  if (p.grain > POST_FX_EPS) {
+    const tile = getGrainTile();
+    const pat = ctx.createPattern(tile, "repeat");
+    if (pat) {
+      const jx = Math.floor(hash01(timeMs * 0.001) * GRAIN_TILE);
+      const jy = Math.floor(hash01(timeMs * 0.001 + 7.3) * GRAIN_TILE);
+      ctx.save();
+      ctx.translate(-jx, -jy);
+      ctx.fillStyle = pat;
+      ctx.globalCompositeOperation = "overlay";
+      ctx.globalAlpha = Math.min(1, p.grain) * 0.5;
+      ctx.fillRect(jx, jy, outW + GRAIN_TILE, outH + GRAIN_TILE);
+      ctx.restore();
+    }
+  }
+  ctx.restore();
+}
+
 export type RenderFrameOpts = {
   layout: FrameLayout;
   /** Output px per layout px (= outputHeight / layout.h). */
@@ -581,6 +804,11 @@ export type RenderFrameOpts = {
   dtSec: number;
   /** Camera bubble; omitted/null when no camera track or it's hidden. */
   camera?: CameraRenderOpts | null;
+  /**
+   * Whole-frame color/stylize pass resolved from the active effect segment
+   * (see lib/effects.ts). Omitted/neutral params skip the extra pass.
+   */
+  postFx?: PostFxParams | null;
 };
 
 /** Crop source rect (video px) + object-fit:contain dest rect (layout px). */
@@ -680,18 +908,24 @@ export function renderFrame(
   o: RenderFrameOpts,
 ) {
   const { layout, s, outW, outH } = o;
-  ctx.save();
-  ctx.clearRect(0, 0, outW, outH);
+  const needsPostFx = !isNeutralPostFx(o.postFx);
+  // Draw the whole frame into a scratch canvas when a post-fx pass is
+  // active so it can be graded as one flat image, then blit the result to
+  // the real destination in a single extra draw. Skips the extra canvas
+  // entirely on the (common) neutral-effect path.
+  const target = needsPostFx ? getPostFxScratch(ctx, outW, outH) : ctx;
+  target.save();
+  target.clearRect(0, 0, outW, outH);
 
   // 1. Wallpaper background (clipped to the frame, blurred + inset bleed).
-  ctx.save();
-  ctx.beginPath();
-  ctx.rect(0, 0, outW, outH);
-  ctx.clip();
-  if (o.blur > 0) ctx.filter = `blur(${o.blur * 0.18 * s}px)`;
+  target.save();
+  target.beginPath();
+  target.rect(0, 0, outW, outH);
+  target.clip();
+  if (o.blur > 0) target.filter = `blur(${o.blur * 0.18 * s}px)`;
   const ins = o.blur > 0 ? o.blur * 0.3 + 4 : 0;
   paintWallpaper(
-    ctx,
+    target,
     -ins * s,
     -ins * s,
     (layout.w + 2 * ins) * s,
@@ -699,7 +933,7 @@ export function renderFrame(
     o.wallpaper,
     o.wallpaperImg,
   );
-  ctx.restore();
+  target.restore();
 
   // 2. Recorded window: translate to wrap origin, apply the zoom transform,
   //    clip to the rounded rect. Cursor is drawn in the same transformed
@@ -712,25 +946,25 @@ export function renderFrame(
   const rr = Math.min(RADIUS_LG * s, rw / 2, rh / 2);
   // Apply `zt`, clip to the rounded rect, run `body` in that space.
   const inZoomSpace = (zt: ZoomTransform, body: () => void) => {
-    ctx.save();
-    ctx.translate(layout.wrapX * s, layout.wrapY * s);
-    ctx.translate(zt.tx * s, zt.ty * s);
-    ctx.scale(zt.scale, zt.scale);
-    ctx.beginPath();
-    ctx.moveTo(rr, 0);
-    ctx.arcTo(rw, 0, rw, rh, rr);
-    ctx.arcTo(rw, rh, 0, rh, rr);
-    ctx.arcTo(0, rh, 0, 0, rr);
-    ctx.arcTo(0, 0, rw, 0, rr);
-    ctx.closePath();
-    ctx.clip();
+    target.save();
+    target.translate(layout.wrapX * s, layout.wrapY * s);
+    target.translate(zt.tx * s, zt.ty * s);
+    target.scale(zt.scale, zt.scale);
+    target.beginPath();
+    target.moveTo(rr, 0);
+    target.arcTo(rw, 0, rw, rh, rr);
+    target.arcTo(rw, rh, 0, rh, rr);
+    target.arcTo(0, rh, 0, 0, rr);
+    target.arcTo(0, 0, rw, 0, rr);
+    target.closePath();
+    target.clip();
     body();
-    ctx.restore();
+    target.restore();
   };
   const paintVideo = (zt: ZoomTransform, alpha: number) =>
     inZoomSpace(zt, () => {
-      if (alpha < 1) ctx.globalAlpha = alpha;
-      ctx.drawImage(
+      if (alpha < 1) target.globalAlpha = alpha;
+      target.drawImage(
         o.videoSource,
         sx,
         sy,
@@ -750,15 +984,21 @@ export function renderFrame(
   // 2b. Synthetic cursor — kept sharp, drawn once at the final transform
   //     (its low-pass state must advance exactly one step per frame).
   if (o.cursorSidecar) {
-    inZoomSpace(zoomTransformAt(o, o.timeMs), () => drawCursor(ctx, o, s));
+    inZoomSpace(zoomTransformAt(o, o.timeMs), () => drawCursor(target, o, s));
   }
 
   // 3. Camera bubble — topmost, in plain output (frame) space so it is
   //    unaffected by the zoom transform. Mirrors the preview overlay DOM.
   if (o.camera) {
-    drawCamera(ctx, o.camera, outW, outH, s);
+    drawCamera(target, o.camera, outW, outH, s);
   }
-  ctx.restore();
+  target.restore();
+
+  // 4. Post-fx: grade the flattened frame (including wallpaper + camera, so
+  //    a look reads as one coherent shot) and blit it to the real ctx.
+  if (needsPostFx) {
+    applyPostFx2D(ctx, target.canvas, outW, outH, s, o.postFx!, o.timeMs);
+  }
 }
 
 function cameraBoxPath(

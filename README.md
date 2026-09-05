@@ -159,6 +159,7 @@ Shipped:
 - ✅ Timeline editing with per-track audio (mic / system) and auto-zoom segments.
 - ✅ 30 / 60 FPS capture selection in the HUD gear menu.
 - ✅ Per-track auto level ("Studio sound") applied to preview playback and export.
+- ✅ Plugin-based timeline video effects (color grade, vignette, film grain, glow) with a registry of built-in looks.
 
 Planned:
 

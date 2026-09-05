@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Ico } from "../icons";
 import type { CaptureArtifact, CursorSidecar } from "../../lib/native";
 import type { ZoomSegment } from "../../lib/autoZoom";
+import type { EffectSegment } from "../../lib/effects";
 import { computeFrameLayout, type CropRect } from "../../lib/compositor";
 import {
   estimateExport,
@@ -88,6 +89,7 @@ export function ExportDialog(props: {
   zoomSegments: ZoomSegment[];
   zoomEnabled: boolean;
   smoothing: number;
+  effectSegments: EffectSegment[];
   trimStart: number;
   trimEnd: number;
   audioTracks: ExportAudioTrack[];
@@ -197,6 +199,7 @@ export function ExportDialog(props: {
       zoomSegments: props.zoomSegments,
       zoomEnabled: props.zoomEnabled,
       smoothing: props.smoothing,
+      effectSegments: props.effectSegments,
       trimStart: props.trimStart,
       trimEnd: props.trimEnd,
       audioTracks: props.audioTracks,

@@ -13,6 +13,8 @@ import {
   type ExportPreset,
 } from "./native";
 import type { ZoomSegment } from "./autoZoom";
+import type { EffectSegment } from "./effects";
+import { resolveEffectParams } from "./effects";
 import {
   cameraAt,
   computeFrameLayout,
@@ -170,6 +172,8 @@ export type ExportParams = {
   zoomEnabled: boolean;
   /** 0..1 (zoomSettings.smoothing / 100). */
   smoothing: number;
+  /** Plugin-based timeline video effects (see lib/effects.ts). */
+  effectSegments: EffectSegment[];
   trimStart: number;
   trimEnd: number;
   /**
@@ -366,6 +370,7 @@ export async function exportVideo(
         glyphImages,
         cursorState,
         dtSec,
+        postFx: resolveEffectParams(t * 1000, p.effectSegments),
         camera: cam
           ? (() => {
               // Keyframed bubble motion, evaluated at the absolute timeline

@@ -25,10 +25,21 @@ import {
   glyphFor,
   isWallpaperImage,
   makeCursorRenderState,
+  postFxCssFilter,
   type CameraKeyframe,
   type RenderFrameOpts,
 } from "../../lib/compositor";
 import { GLCompositor, rasterizeGlyphsGL } from "../../lib/compositorGL";
+import {
+  DEFAULT_EFFECT_DURATION_SEC,
+  DEFAULT_EFFECT_INTENSITY,
+  EFFECT_PLUGINS,
+  effectPlugin,
+  findEffectSegment,
+  newEffectSegment,
+  resolveEffectParams,
+  type EffectSegment,
+} from "../../lib/effects";
 import { ExportDialog } from "./ExportDialog";
 
 /**
@@ -231,7 +242,7 @@ const ASPECT_ORDER: AspectKey[] = ["16:9", "1:1", "9:16", "system"];
 
 type StatePatch = Partial<EditorState>;
 
-const PROJECT_VERSION = 2;
+const PROJECT_VERSION = 3;
 
 /** On-disk shape of a `.openscreen` project file. */
 type ProjectFile = {
@@ -241,6 +252,8 @@ type ProjectFile = {
   editorState: EditorState;
   zoomSettings: ZoomSettings;
   zoomSegments: ZoomSegment[];
+  /** v3+ — plugin-based timeline video effects; absent in older saves. */
+  effectSegments?: EffectSegment[];
 };
 
 /** Load the cursor sidecar that sits next to a recording, if present. */
@@ -1179,6 +1192,181 @@ function ZoomSegmentPanel({
   );
 }
 
+/**
+ * Browse the effect plugin registry and manage the Effects track's segments.
+ * Shown when the "effects" rail tab is active and no segment is selected;
+ * clicking a plugin card inserts a new segment at the playhead.
+ */
+function EffectsLibraryPanel({
+  effectSegments,
+  setEffectSegments,
+  currentTime,
+  duration,
+  onSelect,
+}: {
+  effectSegments: EffectSegment[];
+  setEffectSegments: (next: EffectSegment[]) => void;
+  currentTime: number;
+  duration: number;
+  onSelect: (id: string) => void;
+}) {
+  const fmt = (s: number) => `${s.toFixed(1)}s`;
+
+  const addAt = (pluginId: string) => {
+    const startMs = currentTime * 1000;
+    const endMs = Math.min(duration, currentTime + DEFAULT_EFFECT_DURATION_SEC) * 1000;
+    if (endMs - startMs < 1) return;
+    const seg = newEffectSegment(startMs, endMs, pluginId);
+    setEffectSegments(
+      [...effectSegments, seg].sort((a, b) => a.startMs - b.startMs),
+    );
+    onSelect(seg.id);
+  };
+
+  return (
+    <div className="section">
+      <h3 className="section-title">
+        <Ico.sparkles size={15} /> Effects
+      </h3>
+      <div className="helper-text" style={{ marginTop: -6, marginBottom: 8 }}>
+        Click a look to add it to the timeline at the playhead.
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        {EFFECT_PLUGINS.map((p) => (
+          <button
+            key={p.id}
+            className="btn-wide"
+            style={{ justifyContent: "flex-start", textAlign: "left", flexDirection: "column", alignItems: "flex-start", gap: 2 }}
+            onClick={() => addAt(p.id)}
+            title={`Add "${p.name}" at ${fmt(currentTime)}`}
+          >
+            <span style={{ display: "flex", alignItems: "center", gap: 6, fontWeight: 600 }}>
+              <Ico.sparkles size={12} /> {p.name}
+            </span>
+            <span style={{ fontSize: 11, fontWeight: 400, opacity: 0.75 }}>
+              {p.description}
+            </span>
+          </button>
+        ))}
+      </div>
+
+      <div className="label-row label-strong" style={{ marginTop: 22 }}>
+        Segments · {effectSegments.length}
+      </div>
+      {effectSegments.length === 0 && (
+        <div className="helper-text">No effects yet. Add one above.</div>
+      )}
+      <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 6 }}>
+        {effectSegments.map((seg) => (
+          <div
+            key={seg.id}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              fontSize: 11,
+              color: "var(--text-2)",
+              padding: "4px 6px",
+              borderRadius: 4,
+              background: "var(--surface-2, rgba(255,255,255,0.04))",
+              cursor: "pointer",
+            }}
+            onClick={() => onSelect(seg.id)}
+          >
+            <span>
+              {fmt(seg.startMs / 1000)} → {fmt(seg.endMs / 1000)} ·{" "}
+              {effectPlugin(seg.pluginId).name}
+            </span>
+            <button
+              className="reset"
+              onClick={(e) => {
+                e.stopPropagation();
+                setEffectSegments(effectSegments.filter((s) => s.id !== seg.id));
+              }}
+            >
+              ✕
+            </button>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/** Edit the selected Effects-track segment: plugin choice + intensity. */
+function EffectSegmentPanel({
+  seg,
+  segments,
+  setSegments,
+}: {
+  seg: EffectSegment;
+  segments: EffectSegment[];
+  setSegments: (next: EffectSegment[]) => void;
+}) {
+  const patch = (p: Partial<EffectSegment>) =>
+    setSegments(segments.map((s) => (s.id === seg.id ? { ...s, ...p } : s)));
+  const plugin = effectPlugin(seg.pluginId);
+
+  return (
+    <div className="section">
+      <h3 className="section-title">
+        <Ico.sparkles size={15} /> {plugin.name}
+      </h3>
+      <div className="helper-text" style={{ marginTop: -6, marginBottom: 8 }}>
+        {plugin.description}
+      </div>
+
+      <div className="label-row label-strong">Look</div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+        {EFFECT_PLUGINS.map((p) => {
+          const active = p.id === seg.pluginId;
+          return (
+            <button
+              key={p.id}
+              className="btn-wide"
+              style={{
+                justifyContent: "flex-start",
+                background: active ? "var(--accent, #4f8cff)" : undefined,
+                color: active ? "#fff" : undefined,
+              }}
+              onClick={() => patch({ pluginId: p.id })}
+            >
+              {active ? <Ico.target size={12} /> : <Ico.sparkles size={12} />} {p.name}
+            </button>
+          );
+        })}
+      </div>
+
+      <div className="label-row label-strong" style={{ marginTop: 22 }}>
+        Intensity · {Math.round(seg.intensity * 100)}%
+      </div>
+      <Slider
+        value={Math.round(seg.intensity * 100)}
+        onChange={(v) => patch({ intensity: v / 100 })}
+        min={0}
+        max={100}
+        onReset={() => patch({ intensity: DEFAULT_EFFECT_INTENSITY })}
+      />
+
+      <div className="row-toggle" style={{ marginTop: 18 }}>
+        <div className="col">
+          <div className="label">Disable effect</div>
+          <div className="desc">
+            Turns this segment off without removing it from the timeline.
+          </div>
+        </div>
+        <button
+          className={`switch ${seg.disabled ? "on" : ""}`}
+          onClick={() => patch({ disabled: !seg.disabled })}
+          role="switch"
+          aria-checked={seg.disabled}
+          aria-label="Disable effect"
+        />
+      </div>
+    </div>
+  );
+}
+
 function AudioPanel({
   rows,
   onChange,
@@ -1404,9 +1592,14 @@ function Inspector({
   onAudioTrack,
   selectedAudioKey,
   duration,
+  currentTime,
   hasCamera,
   onCameraAddKeyframe,
   onCameraClearKeyframes,
+  effectSegments,
+  setEffectSegments,
+  selectedEffectSeg,
+  onSelectEffect,
 }: {
   active: string;
   state: EditorState;
@@ -1422,9 +1615,14 @@ function Inspector({
   onAudioTrack: (key: AudioTrackKey, patch: Partial<AudioTrackState>) => void;
   selectedAudioKey: AudioTrackKey | null;
   duration: number;
+  currentTime: number;
   hasCamera: boolean;
   onCameraAddKeyframe: () => void;
   onCameraClearKeyframes: () => void;
+  effectSegments: EffectSegment[];
+  setEffectSegments: (next: EffectSegment[]) => void;
+  selectedEffectSeg: EffectSegment | null;
+  onSelectEffect: (id: string | null) => void;
 }) {
   return (
     <aside className="inspector">
@@ -1436,6 +1634,12 @@ function Inspector({
           defaultLevel={zoomSettings.defaultLevel}
           videoSrc={videoSrc}
           cursorSidecar={cursorSidecar}
+        />
+      ) : selectedEffectSeg ? (
+        <EffectSegmentPanel
+          seg={selectedEffectSeg}
+          segments={effectSegments}
+          setSegments={setEffectSegments}
         />
       ) : active === "cursor" ? (
         <CursorZoomPanel
@@ -1460,6 +1664,14 @@ function Inspector({
           onAddKeyframe={onCameraAddKeyframe}
           onClearKeyframes={onCameraClearKeyframes}
         />
+      ) : active === "effects" ? (
+        <EffectsLibraryPanel
+          effectSegments={effectSegments}
+          setEffectSegments={setEffectSegments}
+          currentTime={currentTime}
+          duration={duration}
+          onSelect={onSelectEffect}
+        />
       ) : (
         <BackgroundPanel state={state} set={set} />
       )}
@@ -1478,6 +1690,7 @@ function IconRail({
     { id: "background", icon: <Ico.rect size={17} />, badge: true },
     { id: "cursor", icon: <Ico.cursor size={17} /> },
     { id: "webcam", icon: <Ico.webcam size={17} /> },
+    { id: "effects", icon: <Ico.sparkles size={17} /> },
     { id: "subtitles", icon: <Ico.speech size={17} />, disabled: true },
     { id: "audio", icon: <Ico.audio size={17} /> },
     { id: "shortcuts", icon: <Ico.cmd size={17} />, disabled: true },
@@ -1634,6 +1847,7 @@ function Canvas({
   cursorSidecar,
   zoomSegments,
   zoomSettings,
+  effectSegments,
   videoNaturalSize,
   cropRect,
   previewFps,
@@ -1654,6 +1868,7 @@ function Canvas({
   cursorSidecar: CursorSidecar | null;
   zoomSegments: ZoomSegment[];
   zoomSettings: ZoomSettings;
+  effectSegments: EffectSegment[];
   videoNaturalSize: { w: number; h: number } | null;
   cropRect: CropRect | null;
   previewFps: number;
@@ -1840,6 +2055,13 @@ function Canvas({
       });
       wrap.style.transformOrigin = "0 0";
       wrap.style.transform = `translate(${zt.tx}px, ${zt.ty}px) scale(${zt.scale})`;
+      // DOM fallback path: apply the CSS-filter-representable subset of the
+      // active effect segment directly to the recorded window. Vignette /
+      // temperature-tint / grain need canvas compositing and are skipped
+      // here — a reasonable degraded look on the rare non-GL path.
+      wrap.style.filter = postFxCssFilter(
+        resolveEffectParams(video.currentTime * 1000, effectSegments),
+      );
     };
     // --- GPU branch: render the recorded window with the shared compositor.
     // Skips redraws while nothing changed (static playhead + decoded frame),
@@ -1859,8 +2081,10 @@ function Canvas({
       cancelVideoFrameCallback?: (id: number) => void;
     };
     if (useGl) {
-      // Neutralize the DOM path's leftovers: the canvas owns zoom + cursor.
+      // Neutralize the DOM path's leftovers: the canvas owns zoom + cursor
+      // + post-fx.
       wrap.style.transform = "";
+      wrap.style.filter = "";
       if (cursorElRef.current) cursorElRef.current.style.display = "none";
       cursorStateRef.current.has = false;
       video.addEventListener("seeked", markDirty);
@@ -1929,6 +2153,7 @@ function Canvas({
         cursorState: cursorStateRef.current,
         dtSec,
         camera: null,
+        postFx: resolveEffectParams(tMs, effectSegments),
       };
       try {
         glc.render(o, { drawWallpaper: false, drawCamera: false });
@@ -1974,6 +2199,7 @@ function Canvas({
     cursorSidecar,
     zoomSegments,
     zoomSettings,
+    effectSegments,
     cropRect,
     previewFps,
     glActive,
@@ -2151,6 +2377,7 @@ function Viewport({
   cursorSidecar,
   zoomSegments,
   zoomSettings,
+  effectSegments,
   videoNaturalSize,
   previewFps,
   cameraSrc,
@@ -2172,6 +2399,7 @@ function Viewport({
   cursorSidecar: CursorSidecar | null;
   zoomSegments: ZoomSegment[];
   zoomSettings: ZoomSettings;
+  effectSegments: EffectSegment[];
   videoNaturalSize: { w: number; h: number } | null;
   previewFps: number;
   cameraSrc: string | null;
@@ -2217,6 +2445,7 @@ function Viewport({
         cursorSidecar={cursorSidecar}
         zoomSegments={zoomSegments}
         zoomSettings={zoomSettings}
+        effectSegments={effectSegments}
         videoNaturalSize={videoNaturalSize}
         cropRect={state.cropRect}
         previewFps={previewFps}
@@ -2433,6 +2662,118 @@ function ZoomChip({
   );
 }
 
+/** Timeline chip for one Effects-track segment. Mirrors ZoomChip exactly. */
+function EffectChip({
+  seg,
+  leftPct,
+  widthPct,
+  totalMs,
+  onUpdate,
+  onDelete,
+  selected,
+  onSelect,
+}: {
+  seg: EffectSegment;
+  leftPct: number;
+  widthPct: number;
+  totalMs: number;
+  onUpdate: (patch: Partial<EffectSegment>) => void;
+  onDelete: () => void;
+  selected: boolean;
+  onSelect: () => void;
+}) {
+  const dragMode = useRef<null | "move" | "start" | "end">(null);
+  const dragRef = useRef<{ trackWidth: number; trackLeft: number; startMs: number; endMs: number }>({
+    trackWidth: 0,
+    trackLeft: 0,
+    startMs: 0,
+    endMs: 0,
+  });
+
+  useEffect(() => {
+    const move = (e: MouseEvent) => {
+      const mode = dragMode.current;
+      if (!mode) return;
+      const { trackWidth, trackLeft, startMs, endMs } = dragRef.current;
+      if (trackWidth <= 0) return;
+      const dxPct = ((e.clientX - trackLeft) / trackWidth) * 100;
+      const dxMs = (dxPct / 100) * totalMs;
+      if (mode === "start") {
+        const next = Math.max(0, Math.min(endMs - 50, dxMs));
+        onUpdate({ startMs: next });
+      } else if (mode === "end") {
+        const next = Math.max(startMs + 50, Math.min(totalMs, dxMs));
+        onUpdate({ endMs: next });
+      } else {
+        const grabOffset = dragRef.current.startMs;
+        const len = endMs - startMs;
+        let newStart = dxMs - grabOffset;
+        newStart = Math.max(0, Math.min(totalMs - len, newStart));
+        onUpdate({ startMs: newStart, endMs: newStart + len });
+      }
+    };
+    const up = () => {
+      dragMode.current = null;
+    };
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
+    return () => {
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", up);
+    };
+  }, [onUpdate, totalMs]);
+
+  const beginDrag = (mode: "move" | "start" | "end") => (e: React.MouseEvent) => {
+    e.stopPropagation();
+    e.preventDefault();
+    onSelect();
+    const track = (e.currentTarget as HTMLElement).closest(".tl-track.effects") as HTMLElement | null;
+    if (!track) return;
+    const rect = track.getBoundingClientRect();
+    const grab = ((e.clientX - rect.left) / rect.width) * totalMs - seg.startMs;
+    dragMode.current = mode;
+    dragRef.current = {
+      trackWidth: rect.width,
+      trackLeft: rect.left,
+      startMs: mode === "move" ? grab : seg.startMs,
+      endMs: seg.endMs,
+    };
+  };
+
+  const plugin = effectPlugin(seg.pluginId);
+
+  return (
+    <div
+      className={`zoom-chip effect-chip ${selected ? "selected" : ""} ${seg.disabled ? "disabled" : ""}`}
+      style={{
+        position: "absolute",
+        top: 0,
+        bottom: 0,
+        left: `${leftPct}%`,
+        width: `${widthPct}%`,
+      }}
+      onMouseDown={beginDrag("move")}
+      title={`${plugin.name} · ${Math.round(seg.intensity * 100)}% · click to drag, edges to resize`}
+    >
+      <span className="handle left" onMouseDown={beginDrag("start")} />
+      <span className="body">
+        <Ico.sparkles size={10} /> {plugin.name}
+      </span>
+      <span className="handle right" onMouseDown={beginDrag("end")} />
+      <button
+        className="del"
+        onMouseDown={(e) => e.stopPropagation()}
+        onClick={(e) => {
+          e.stopPropagation();
+          onDelete();
+        }}
+      >
+        ✕
+      </button>
+    </div>
+  );
+}
+
 /** Descriptor for one sidecar audio row shown in the timeline. */
 type AudioRowInfo = {
   key: AudioTrackKey;
@@ -2575,6 +2916,10 @@ function Timeline({
   cursorSidecar,
   selectedZoomId,
   setSelectedZoomId,
+  effectSegments,
+  setEffectSegments,
+  selectedEffectId,
+  setSelectedEffectId,
   onHover,
 }: {
   duration: number;
@@ -2607,6 +2952,10 @@ function Timeline({
   selectedZoomId: string | null;
   onHover?: (t: number | null) => void;
   setSelectedZoomId: (id: string | null) => void;
+  effectSegments: EffectSegment[];
+  setEffectSegments: (next: EffectSegment[]) => void;
+  selectedEffectId: string | null;
+  setSelectedEffectId: (id: string | null) => void;
 }) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const ref = useRef<HTMLDivElement | null>(null);
@@ -2661,6 +3010,7 @@ function Timeline({
   const beginDrag = (e: React.MouseEvent) => {
     e.preventDefault();
     setSelectedZoomId(null);
+    setSelectedEffectId(null);
     if (hoverT !== null) {
       setHoverT(null);
       onHover?.(null);
@@ -2764,6 +3114,49 @@ function Timeline({
     );
     setSelectedZoomId(seg.id);
     setZoomGhostT(null);
+  };
+
+  // Manual effect authoring — same ghost/click-to-add interaction as the
+  // zoom track, on its own row so plugin looks can be scheduled directly.
+  const effectTrackRef = useRef<HTMLDivElement | null>(null);
+  const [effectGhostT, setEffectGhostT] = useState<number | null>(null);
+
+  const effectGhostFromX = (clientX: number): number | null => {
+    const el = effectTrackRef.current;
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0) return null;
+    return Math.max(0, Math.min(TOTAL, ((clientX - r.left) / r.width) * TOTAL));
+  };
+
+  const handleEffectTrackMove = (e: React.MouseEvent) => {
+    if (e.buttons !== 0 || (e.target as HTMLElement).closest(".effect-chip")) {
+      if (effectGhostT !== null) setEffectGhostT(null);
+      return;
+    }
+    setEffectGhostT(effectGhostFromX(e.clientX));
+  };
+
+  const handleEffectTrackLeave = () => {
+    if (effectGhostT !== null) setEffectGhostT(null);
+  };
+
+  const addManualEffectAt = (e: React.MouseEvent) => {
+    // Override the track's seek-on-mousedown; chips stopPropagation so this
+    // only fires on empty effects-track space.
+    e.stopPropagation();
+    if (e.button !== 0) return;
+    const t = effectGhostFromX(e.clientX);
+    if (t === null) return;
+    const startMs = t * 1000;
+    const endMs = Math.min(TOTAL, t + DEFAULT_EFFECT_DURATION_SEC) * 1000;
+    if (endMs - startMs < 1) return;
+    const seg = newEffectSegment(startMs, endMs);
+    setEffectSegments(
+      [...effectSegments, seg].sort((a, b) => a.startMs - b.startMs),
+    );
+    setSelectedEffectId(seg.id);
+    setEffectGhostT(null);
   };
 
   // Keep playhead in view while playing when zoomed in.
@@ -2883,6 +3276,9 @@ function Timeline({
           ))}
           <div className="tl-gutter-row zoom">
             <Ico.zoomIn size={12} />
+          </div>
+          <div className="tl-gutter-row effects">
+            <Ico.sparkles size={12} />
           </div>
         </div>
         <div className="tl-tracks-inner">
@@ -3133,7 +3529,10 @@ function Timeline({
                 widthPct={width}
                 totalMs={totalMs}
                 selected={selectedZoomId === seg.id}
-                onSelect={() => setSelectedZoomId(seg.id)}
+                onSelect={() => {
+                  setSelectedZoomId(seg.id);
+                  setSelectedEffectId(null);
+                }}
                 onUpdate={(patch) =>
                   setZoomSegments(
                     zoomSegments.map((s) => (s.id === seg.id ? { ...s, ...patch } : s)),
@@ -3142,6 +3541,77 @@ function Timeline({
                 onDelete={() => {
                   setZoomSegments(zoomSegments.filter((s) => s.id !== seg.id));
                   if (selectedZoomId === seg.id) setSelectedZoomId(null);
+                }}
+              />
+            );
+          })}
+        </div>
+
+        <div
+          className="tl-track effects"
+          style={{ position: "relative" }}
+          ref={effectTrackRef}
+          onMouseMove={handleEffectTrackMove}
+          onMouseLeave={handleEffectTrackLeave}
+          onMouseDown={addManualEffectAt}
+        >
+          {effectSegments.length === 0 && effectGhostT === null && (
+            <div
+              style={{
+                position: "absolute",
+                inset: 0,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                fontSize: 10,
+                color: "var(--text-3)",
+                pointerEvents: "none",
+              }}
+            >
+              Click to add a plugin effect
+            </div>
+          )}
+          {effectGhostT !== null && (
+            <div
+              className="effect-ghost"
+              style={{
+                position: "absolute",
+                top: 0,
+                bottom: 0,
+                left: `${(effectGhostT / TOTAL) * 100}%`,
+                width: `${(Math.min(DEFAULT_EFFECT_DURATION_SEC, TOTAL - effectGhostT) / TOTAL) * 100}%`,
+                pointerEvents: "none",
+              }}
+            >
+              <Ico.plus size={12} />
+            </div>
+          )}
+          {effectSegments.map((seg) => {
+            const totalMs = TOTAL * 1000;
+            const startMs = Math.max(0, Math.min(totalMs, seg.startMs));
+            const endMs = Math.max(startMs, Math.min(totalMs, seg.endMs));
+            const left = (startMs / Math.max(1, totalMs)) * 100;
+            const width = ((endMs - startMs) / Math.max(1, totalMs)) * 100;
+            return (
+              <EffectChip
+                key={seg.id}
+                seg={seg}
+                leftPct={left}
+                widthPct={width}
+                totalMs={totalMs}
+                selected={selectedEffectId === seg.id}
+                onSelect={() => {
+                  setSelectedEffectId(seg.id);
+                  setSelectedZoomId(null);
+                }}
+                onUpdate={(patch) =>
+                  setEffectSegments(
+                    effectSegments.map((s) => (s.id === seg.id ? { ...s, ...patch } : s)),
+                  )
+                }
+                onDelete={() => {
+                  setEffectSegments(effectSegments.filter((s) => s.id !== seg.id));
+                  if (selectedEffectId === seg.id) setSelectedEffectId(null);
                 }}
               />
             );
@@ -3406,20 +3876,31 @@ export function Editor({
     () => zoomSegments.find((s) => s.id === selectedZoomId) ?? null,
     [zoomSegments, selectedZoomId],
   );
+  const [effectSegments, setEffectSegments] = useState<EffectSegment[]>([]);
+  const [selectedEffectId, setSelectedEffectId] = useState<string | null>(null);
+  const selectedEffectSeg = useMemo(
+    () => findEffectSegment(effectSegments, selectedEffectId),
+    [effectSegments, selectedEffectId],
+  );
   const videoRef = useRef<HTMLVideoElement | null>(null);
 
   // ---- Undo / redo -----------------------------------------------------
-  // History covers the user-editable surface: canvas settings (`state`)
-  // and zoom segments. Rapid changes (slider/timeline drags) are coalesced
-  // — a snapshot is committed only once edits settle, so one drag is one
-  // undo step. Programmatic resets (project load, fresh recording, the
-  // wallpaper default) rebase the baseline instead of adding a step.
-  type EditSnapshot = { state: EditorState; zoomSegments: ZoomSegment[] };
+  // History covers the user-editable surface: canvas settings (`state`),
+  // zoom segments, and effect segments. Rapid changes (slider/timeline
+  // drags) are coalesced — a snapshot is committed only once edits settle,
+  // so one drag is one undo step. Programmatic resets (project load, fresh
+  // recording, the wallpaper default) rebase the baseline instead of adding
+  // a step.
+  type EditSnapshot = {
+    state: EditorState;
+    zoomSegments: ZoomSegment[];
+    effectSegments: EffectSegment[];
+  };
   const histRef = useRef<{
     past: EditSnapshot[];
     present: EditSnapshot;
     future: EditSnapshot[];
-  }>({ past: [], present: { state, zoomSegments }, future: [] });
+  }>({ past: [], present: { state, zoomSegments, effectSegments }, future: [] });
   const histApplyingRef = useRef(false);
   const histRebaseRef = useRef(false);
   const [, setHistTick] = useState(0);
@@ -3432,7 +3913,7 @@ export function Editor({
     }
     const t = setTimeout(() => {
       const h = histRef.current;
-      const cur: EditSnapshot = { state, zoomSegments };
+      const cur: EditSnapshot = { state, zoomSegments, effectSegments };
       if (histRebaseRef.current) {
         histRebaseRef.current = false;
         h.past = [];
@@ -3448,15 +3929,16 @@ export function Editor({
       bumpHist();
     }, 350);
     return () => clearTimeout(t);
-  }, [state, zoomSegments]);
+  }, [state, zoomSegments, effectSegments]);
 
-  const liveSnapRef = useRef<EditSnapshot>({ state, zoomSegments });
-  liveSnapRef.current = { state, zoomSegments };
+  const liveSnapRef = useRef<EditSnapshot>({ state, zoomSegments, effectSegments });
+  liveSnapRef.current = { state, zoomSegments, effectSegments };
 
   const applySnapshot = (snap: EditSnapshot) => {
     histApplyingRef.current = true;
     setState(snap.state);
     setZoomSegments(snap.zoomSegments);
+    setEffectSegments(snap.effectSegments);
   };
   // Commit any edit still inside the 350ms coalesce window so a quick
   // undo/redo doesn't silently discard it.
@@ -3501,17 +3983,18 @@ export function Editor({
     return () => window.removeEventListener("keydown", onKey);
   }, [undo, redo]);
 
-  // Esc clears the active zoom selection — surfaces the icon-rail tab again.
-  // Delete/Backspace removes the selected zoom block (unless the user is
-  // typing in a field, where those keys mean "edit text").
+  // Esc clears the active zoom/effect selection — surfaces the icon-rail
+  // tab again. Delete/Backspace removes the selected block (unless the
+  // user is typing in a field, where those keys mean "edit text").
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         setSelectedZoomId(null);
+        setSelectedEffectId(null);
         return;
       }
       if (e.key !== "Delete" && e.key !== "Backspace") return;
-      if (!selectedZoomId) return;
+      if (!selectedZoomId && !selectedEffectId) return;
       const t = e.target as HTMLElement | null;
       if (
         t &&
@@ -3522,17 +4005,26 @@ export function Editor({
         return;
       }
       e.preventDefault();
-      setZoomSegments(zoomSegments.filter((s) => s.id !== selectedZoomId));
-      setSelectedZoomId(null);
+      if (selectedZoomId) {
+        setZoomSegments(zoomSegments.filter((s) => s.id !== selectedZoomId));
+        setSelectedZoomId(null);
+      }
+      if (selectedEffectId) {
+        setEffectSegments(effectSegments.filter((s) => s.id !== selectedEffectId));
+        setSelectedEffectId(null);
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [selectedZoomId, zoomSegments, setZoomSegments]);
+  }, [selectedZoomId, zoomSegments, setZoomSegments, selectedEffectId, effectSegments, setEffectSegments]);
 
-  // When a segment is selected, highlight the cursor rail icon.
+  // When a segment is selected, highlight the matching rail icon.
   useEffect(() => {
     if (selectedZoomId) setActiveRail("cursor");
   }, [selectedZoomId]);
+  useEffect(() => {
+    if (selectedEffectId) setActiveRail("effects");
+  }, [selectedEffectId]);
 
   // Default the canvas background to the user's current macOS desktop
   // wallpaper. Match it onto a bundled high-res entry (the raw detected
@@ -3699,6 +4191,8 @@ export function Editor({
         audioTracks: defaultAudioTracks(),
         camera: defaultCameraState(),
       }));
+      setEffectSegments([]);
+      setSelectedEffectId(null);
       // A fresh recording: derive auto-zoom from its cursor sidecar.
       (async () => {
         const sidecar = await fetchSidecar(a);
@@ -4106,6 +4600,7 @@ export function Editor({
       editorState: state,
       zoomSettings,
       zoomSegments,
+      effectSegments,
     };
     try {
       const savedPath = await native.saveProject(
@@ -4168,6 +4663,8 @@ export function Editor({
     setZoomSettingsRaw((s) => ({ ...s, ...project.zoomSettings }));
     setZoomSegments(project.zoomSegments ?? []);
     setSelectedZoomId(null);
+    setEffectSegments(project.effectSegments ?? []);
+    setSelectedEffectId(null);
     setCurrentTime(0);
     setPlaying(false);
     setProjectName(baseName(res.path));
@@ -4361,6 +4858,7 @@ export function Editor({
           cursorSidecar={cursorSidecar}
           zoomSegments={zoomSegments}
           zoomSettings={zoomSettings}
+          effectSegments={effectSegments}
           videoNaturalSize={videoNaturalSize}
           previewFps={previewFpsFor(perfSettings)}
           cameraSrc={cameraSrc}
@@ -4388,6 +4886,11 @@ export function Editor({
           hasCamera={cameraSrc !== null}
           onCameraAddKeyframe={addCameraKeyframe}
           onCameraClearKeyframes={clearCameraKeyframes}
+          currentTime={currentTime}
+          effectSegments={effectSegments}
+          setEffectSegments={setEffectSegments}
+          selectedEffectSeg={selectedEffectSeg}
+          onSelectEffect={setSelectedEffectId}
         />
         <div
           className="inspector-resizer"
@@ -4434,6 +4937,10 @@ export function Editor({
         cursorSidecar={cursorSidecar}
         selectedZoomId={selectedZoomId}
         setSelectedZoomId={setSelectedZoomId}
+        effectSegments={effectSegments}
+        setEffectSegments={setEffectSegments}
+        selectedEffectId={selectedEffectId}
+        setSelectedEffectId={setSelectedEffectId}
         onHover={handleTimelineHover}
       />
       {cropOpen && (
@@ -4472,6 +4979,7 @@ export function Editor({
               0,
               Math.min(1, zoomSettings.smoothing / 100),
             )}
+            effectSegments={effectSegments}
             trimStart={state.trimStart}
             trimEnd={state.trimEnd}
             audioTracks={[

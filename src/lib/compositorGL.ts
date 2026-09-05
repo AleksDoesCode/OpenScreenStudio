@@ -18,9 +18,11 @@ import {
   computeVideoPlacement,
   CURSOR_GLYPHS,
   glyphFor,
+  isNeutralPostFx,
   RADIUS_LG,
   renderWallpaperToCanvas,
   zoomTransformAt,
+  type PostFxParams,
   type RenderFrameOpts,
   type ZoomTransform,
 } from "./compositor";
@@ -125,6 +127,119 @@ void main() {
 }`;
 
 // ---------------------------------------------------------------------------
+// Post-fx fullscreen pass — reuses VS (same NDC/UV mapping the scene was
+// rendered with) paired with a dedicated fragment shader that grades the
+// baked scene texture. Mirrors applyPostFx2D in lib/compositor exactly:
+// blur (cheap radial multi-tap) → brightness/contrast/saturation → hue
+// rotate → sepia → temperature tint (CSS "overlay" blend, replicated per-
+// channel) → invert → vignette → animated grain.
+// ---------------------------------------------------------------------------
+
+const POST_FS = `#version 300 es
+precision highp float;
+uniform sampler2D uTex;
+uniform vec2 uTexSize;
+uniform float uBrightness;
+uniform float uContrast;
+uniform float uSaturation;
+uniform float uTemperature;
+uniform float uHueRotateDeg;
+uniform float uSepia;
+uniform float uInvert;
+uniform float uVignette;
+uniform float uVignetteSoftness;
+uniform float uGrain;
+uniform float uGrainSeed;
+uniform float uBlurPx;
+in vec2 vUv;
+out vec4 frag;
+
+float hash(vec2 p) {
+  return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+}
+
+vec3 applyHue(vec3 c, float deg) {
+  float a = radians(deg);
+  float cosA = cos(a);
+  float sinA = sin(a);
+  mat3 m = mat3(
+    0.299 + 0.701 * cosA + 0.168 * sinA, 0.587 - 0.587 * cosA + 0.330 * sinA, 0.114 - 0.114 * cosA - 0.497 * sinA,
+    0.299 - 0.299 * cosA - 0.328 * sinA, 0.587 + 0.413 * cosA + 0.035 * sinA, 0.114 - 0.114 * cosA + 0.292 * sinA,
+    0.299 - 0.300 * cosA + 1.25 * sinA, 0.587 - 0.588 * cosA - 1.05 * sinA, 0.114 + 0.886 * cosA - 0.203 * sinA
+  );
+  return clamp(m * c, 0.0, 1.0);
+}
+
+void main() {
+  vec4 base;
+  if (uBlurPx > 0.05) {
+    vec2 texel = 1.0 / uTexSize;
+    vec4 sum = texture(uTex, vUv) * 2.0;
+    float wsum = 2.0;
+    const int N = 8;
+    for (int i = 0; i < N; i++) {
+      float ang = 6.2831853 * float(i) / float(N);
+      vec2 off = vec2(cos(ang), sin(ang)) * uBlurPx * texel;
+      sum += texture(uTex, vUv + off);
+      wsum += 1.0;
+    }
+    base = sum / wsum;
+  } else {
+    base = texture(uTex, vUv);
+  }
+  float a = base.a;
+  vec3 c = a > 0.0001 ? base.rgb / a : base.rgb;
+
+  c = (c - 0.5) * uContrast + 0.5;
+  c *= uBrightness;
+
+  float g = dot(c, vec3(0.299, 0.587, 0.114));
+  c = mix(vec3(g), c, uSaturation);
+
+  if (abs(uHueRotateDeg) > 0.01) c = applyHue(c, uHueRotateDeg);
+
+  if (uSepia > 0.001) {
+    vec3 sep = vec3(
+      dot(c, vec3(0.393, 0.769, 0.189)),
+      dot(c, vec3(0.349, 0.686, 0.168)),
+      dot(c, vec3(0.272, 0.534, 0.131))
+    );
+    c = mix(c, sep, clamp(uSepia, 0.0, 1.0));
+  }
+
+  if (abs(uTemperature) > 0.001) {
+    vec3 tint = uTemperature > 0.0 ? vec3(1.0, 0.604, 0.235) : vec3(0.235, 0.627, 1.0);
+    vec3 cc = clamp(c, 0.0, 1.0);
+    vec3 ov = mix(2.0 * cc * tint, 1.0 - 2.0 * (1.0 - cc) * (1.0 - tint), step(0.5, cc));
+    float amt = min(1.0, abs(uTemperature)) * 0.25;
+    c = mix(c, ov, amt);
+  }
+
+  if (uInvert > 0.001) c = mix(c, 1.0 - c, clamp(uInvert, 0.0, 1.0));
+
+  c = clamp(c, 0.0, 1.0);
+
+  if (uVignette > 0.001) {
+    vec2 pxCoord = vUv * uTexSize;
+    vec2 center = uTexSize * 0.5;
+    float outerR = length(uTexSize) * 0.5;
+    float soft = 0.15 + uVignetteSoftness * 0.65;
+    float innerR = outerR * (1.0 - soft) * (1.0 - uVignette * 0.35);
+    float dist = length(pxCoord - center);
+    float v = smoothstep(innerR, outerR, dist);
+    c *= (1.0 - v * clamp(uVignette, 0.0, 1.0));
+  }
+
+  if (uGrain > 0.001) {
+    float n = hash(gl_FragCoord.xy + uGrainSeed) - 0.5;
+    c += n * clamp(uGrain, 0.0, 1.0) * 0.35;
+  }
+
+  c = clamp(c, 0.0, 1.0);
+  frag = vec4(c * a, a);
+}`;
+
+// ---------------------------------------------------------------------------
 // Cursor glyph textures (shadow baked in, since GL has no ctx.shadowBlur)
 // ---------------------------------------------------------------------------
 
@@ -197,6 +312,28 @@ type Uniforms = {
   uShadowBlur: WebGLUniformLocation;
 };
 
+/** Uniforms for the post-fx fullscreen pass (see POST_FS). */
+type PostUniforms = {
+  uXf: WebGLUniformLocation;
+  uClipXf: WebGLUniformLocation;
+  uViewport: WebGLUniformLocation;
+  uSrcRect: WebGLUniformLocation;
+  uTex: WebGLUniformLocation;
+  uTexSize: WebGLUniformLocation;
+  uBrightness: WebGLUniformLocation;
+  uContrast: WebGLUniformLocation;
+  uSaturation: WebGLUniformLocation;
+  uTemperature: WebGLUniformLocation;
+  uHueRotateDeg: WebGLUniformLocation;
+  uSepia: WebGLUniformLocation;
+  uInvert: WebGLUniformLocation;
+  uVignette: WebGLUniformLocation;
+  uVignetteSoftness: WebGLUniformLocation;
+  uGrain: WebGLUniformLocation;
+  uGrainSeed: WebGLUniformLocation;
+  uBlurPx: WebGLUniformLocation;
+};
+
 type DrawOpts = {
   xf: Affine;
   src?: [number, number, number, number];
@@ -211,7 +348,14 @@ type DrawOpts = {
 
 export class GLCompositor {
   private gl: WebGL2RenderingContext;
+  private program: WebGLProgram;
   private uniforms: Uniforms;
+  private postProgram: WebGLProgram;
+  private postUniforms: PostUniforms;
+  private postFbo: WebGLFramebuffer | null = null;
+  private postTex: WebGLTexture | null = null;
+  private postTexW = 0;
+  private postTexH = 0;
   private videoTex: WebGLTexture;
   private cameraTex: WebGLTexture;
   private wallpaperTex: WebGLTexture | null = null;
@@ -247,6 +391,7 @@ export class GLCompositor {
   private constructor(gl: WebGL2RenderingContext) {
     this.gl = gl;
     const program = this.buildProgram(VS, FS);
+    this.program = program;
     gl.useProgram(program);
     const u = (name: string) => {
       const loc = gl.getUniformLocation(program, name);
@@ -283,6 +428,40 @@ export class GLCompositor {
     gl.uniform1i(this.uniforms.uTex, 0);
     this.videoTex = this.makeTexture();
     this.cameraTex = this.makeTexture();
+
+    // Post-fx pass: pairs the *same* VS (identical NDC/UV mapping to the
+    // scene pass) with a dedicated grading fragment shader, so the fullscreen
+    // blit needs no separate coordinate math to get right.
+    const postProgram = this.buildProgram(VS, POST_FS);
+    this.postProgram = postProgram;
+    gl.useProgram(postProgram);
+    const pu = (name: string) => {
+      const loc = gl.getUniformLocation(postProgram, name);
+      if (!loc) throw new Error(`Missing post-fx uniform ${name}`);
+      return loc;
+    };
+    this.postUniforms = {
+      uXf: pu("uXf"),
+      uClipXf: pu("uClipXf"),
+      uViewport: pu("uViewport"),
+      uSrcRect: pu("uSrcRect"),
+      uTex: pu("uTex"),
+      uTexSize: pu("uTexSize"),
+      uBrightness: pu("uBrightness"),
+      uContrast: pu("uContrast"),
+      uSaturation: pu("uSaturation"),
+      uTemperature: pu("uTemperature"),
+      uHueRotateDeg: pu("uHueRotateDeg"),
+      uSepia: pu("uSepia"),
+      uInvert: pu("uInvert"),
+      uVignette: pu("uVignette"),
+      uVignetteSoftness: pu("uVignetteSoftness"),
+      uGrain: pu("uGrain"),
+      uGrainSeed: pu("uGrainSeed"),
+      uBlurPx: pu("uBlurPx"),
+    };
+    gl.uniform1i(this.postUniforms.uTex, 0);
+    gl.useProgram(program);
   }
 
   private buildProgram(vsSrc: string, fsSrc: string): WebGLProgram {
@@ -389,6 +568,15 @@ export class GLCompositor {
       canvas.width = outW;
       canvas.height = outH;
     }
+    // A previous frame may have left the post-fx program bound (its own
+    // draw calls don't go through `draw()`, which assumes `this.program`).
+    gl.useProgram(this.program);
+    const usePostFx = !isNeutralPostFx(o.postFx);
+    if (usePostFx) this.ensurePostTarget(outW, outH);
+    // Scene renders into the post-fx offscreen target when a look is active,
+    // so the whole flattened frame (wallpaper + video + cursor + camera) can
+    // be graded as one image; otherwise straight to the canvas as before.
+    gl.bindFramebuffer(gl.FRAMEBUFFER, usePostFx ? this.postFbo : null);
     gl.viewport(0, 0, outW, outH);
     gl.uniform2f(this.uniforms.uViewport, outW, outH);
     gl.clearColor(0, 0, 0, 0);
@@ -522,6 +710,69 @@ export class GLCompositor {
         });
       }
     }
+
+    // 4. Post-fx: grade the flattened scene texture and blit it to the real
+    //    canvas framebuffer in one fullscreen pass.
+    if (usePostFx) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.viewport(0, 0, outW, outH);
+      gl.clearColor(0, 0, 0, 0);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      this.drawPostFx(o.postFx!, outW, outH, o.timeMs, s);
+    }
+  }
+
+  /** Lazily (re)create the offscreen color target the scene bakes into. */
+  private ensurePostTarget(w: number, h: number) {
+    const gl = this.gl;
+    if (this.postTex && this.postTexW === w && this.postTexH === h) return;
+    if (!this.postTex) this.postTex = this.makeTexture();
+    gl.bindTexture(gl.TEXTURE_2D, this.postTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    if (!this.postFbo) this.postFbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.postFbo);
+    gl.framebufferTexture2D(
+      gl.FRAMEBUFFER,
+      gl.COLOR_ATTACHMENT0,
+      gl.TEXTURE_2D,
+      this.postTex,
+      0,
+    );
+    this.postTexW = w;
+    this.postTexH = h;
+  }
+
+  /** Fullscreen grade pass — reads `this.postTex`, writes the bound target. */
+  private drawPostFx(
+    p: PostFxParams,
+    outW: number,
+    outH: number,
+    timeMs: number,
+    s: number,
+  ) {
+    const gl = this.gl;
+    const u = this.postUniforms;
+    gl.useProgram(this.postProgram);
+    gl.uniformMatrix3fv(u.uXf, false, toMat3(sc(outW, outH), this.mat3Scratch));
+    gl.uniformMatrix3fv(u.uClipXf, false, toMat3(AFF_I, this.mat3Scratch));
+    gl.uniform2f(u.uViewport, outW, outH);
+    gl.uniform4f(u.uSrcRect, 0, 0, 1, 1);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.postTex);
+    gl.uniform2f(u.uTexSize, outW, outH);
+    gl.uniform1f(u.uBrightness, p.brightness);
+    gl.uniform1f(u.uContrast, p.contrast);
+    gl.uniform1f(u.uSaturation, p.saturation);
+    gl.uniform1f(u.uTemperature, p.temperature);
+    gl.uniform1f(u.uHueRotateDeg, p.hueRotateDeg);
+    gl.uniform1f(u.uSepia, p.sepia);
+    gl.uniform1f(u.uInvert, p.invert);
+    gl.uniform1f(u.uVignette, p.vignette);
+    gl.uniform1f(u.uVignetteSoftness, p.vignetteSoftness);
+    gl.uniform1f(u.uGrain, p.grain);
+    gl.uniform1f(u.uGrainSeed, (timeMs % 100000) * 0.137);
+    gl.uniform1f(u.uBlurPx, p.blur * s);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
 
   /**
@@ -547,6 +798,8 @@ export class GLCompositor {
     gl.deleteTexture(this.videoTex);
     gl.deleteTexture(this.cameraTex);
     if (this.wallpaperTex) gl.deleteTexture(this.wallpaperTex);
+    if (this.postTex) gl.deleteTexture(this.postTex);
+    if (this.postFbo) gl.deleteFramebuffer(this.postFbo);
     for (const tex of this.glyphTex.values()) gl.deleteTexture(tex);
     this.glyphTex.clear();
     if (opts.loseContext) {
