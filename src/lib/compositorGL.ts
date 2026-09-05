@@ -429,9 +429,9 @@ export class GLCompositor {
     this.videoTex = this.makeTexture();
     this.cameraTex = this.makeTexture();
 
-    // Post-fx pass: pairs the *same* VS (identical NDC/UV mapping to the
-    // scene pass) with a dedicated grading fragment shader, so the fullscreen
-    // blit needs no separate coordinate math to get right.
+    // Post-fx pass: pairs the *same* VS (identical NDC mapping to the scene
+    // pass) with a dedicated grading fragment shader. Only the V axis differs
+    // — see drawPostFx — so the fullscreen blit needs no extra vertex math.
     const postProgram = this.buildProgram(VS, POST_FS);
     this.postProgram = postProgram;
     gl.useProgram(postProgram);
@@ -756,7 +756,12 @@ export class GLCompositor {
     gl.uniformMatrix3fv(u.uXf, false, toMat3(sc(outW, outH), this.mat3Scratch));
     gl.uniformMatrix3fv(u.uClipXf, false, toMat3(AFF_I, this.mat3Scratch));
     gl.uniform2f(u.uViewport, outW, outH);
-    gl.uniform4f(u.uSrcRect, 0, 0, 1, 1);
+    // V is flipped: the scene pass writes this texture through a render
+    // target, whose row 0 sits at NDC y = -1 — i.e. the *bottom* of the
+    // y-down output frame — whereas texImage2D uploads (what the scene pass
+    // samples) put the source's top row at v = 0. Sampling 0..1 here would
+    // blit the baked scene upside down.
+    gl.uniform4f(u.uSrcRect, 0, 1, 1, 0);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.postTex);
     gl.uniform2f(u.uTexSize, outW, outH);
