@@ -160,6 +160,8 @@ pub(crate) struct SegmentRecorder {
     // so the SCK delegate's `on_stop` firing is recognised as expected and
     // doesn't emit a duplicate "recording-stopped-externally" event.
     stop_emitted: Arc<AtomicBool>,
+    // Set once SCRecordingOutput has finished (or failed) writing the segment file.
+    finished: Arc<AtomicBool>,
 }
 
 #[cfg(target_os = "macos")]
@@ -510,11 +512,19 @@ pub(crate) fn build_and_start_segment(
         stream_emit("stream.on_stop", err);
     });
 
+    let finished = Arc::new(AtomicBool::new(false));
     let rec_finish_emit = emit_external_stop.clone();
     let rec_fail_emit = emit_external_stop.clone();
+    let (finish_flag, fail_flag) = (Arc::clone(&finished), Arc::clone(&finished));
     let rec_delegate = RecordingCallbacks::new()
-        .on_finish(move || rec_finish_emit("recording.on_finish", None))
-        .on_fail(move |e| rec_fail_emit("recording.on_fail", Some(e)));
+        .on_finish(move || {
+            finish_flag.store(true, Ordering::SeqCst);
+            rec_finish_emit("recording.on_finish", None)
+        })
+        .on_fail(move |e| {
+            fail_flag.store(true, Ordering::SeqCst);
+            rec_fail_emit("recording.on_fail", Some(e))
+        });
 
     let rec_output = SCRecordingOutput::new_with_delegate(&rec_config, rec_delegate)
         .ok_or_else(|| "Failed to create SCRecordingOutput (requires macOS 15+).".to_string())?;
@@ -575,6 +585,7 @@ pub(crate) fn build_and_start_segment(
         system_tap,
         mic_tap,
         stop_emitted,
+        finished,
     })
 }
 
@@ -927,9 +938,11 @@ pub(crate) fn stop_active_segment(rec: &mut ActiveRecording) -> Result<(), Strin
             .stream
             .stop_capture()
             .map_err(|e| format!("stop_capture failed: {e:?}"));
-        // SCRecordingOutput finalises the moov atom asynchronously after stop;
-        // give it a beat so the segment file is playable when concatenated.
-        std::thread::sleep(Duration::from_millis(400));
+        // SCRecordingOutput writes the file asynchronously after stop; wait for its finish callback.
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while !seg.finished.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
         // Collect even when stop failed: the taps must be finalized either
         // way or their WAVs are left with invalid headers.
         collect_segment(rec, seg);
