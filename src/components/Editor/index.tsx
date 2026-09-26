@@ -42,6 +42,7 @@ import {
 } from "../../lib/effects";
 import {
   SPEED_MAX,
+  NATIVE_RATE_MAX,
   SPEED_MIN,
   SPEED_PRESETS,
   MIN_CLIP_SEC,
@@ -56,11 +57,46 @@ import {
   patchClip,
   removeClip,
   splitAt,
+  splitSegmentsAt,
   srcRangePieces,
   srcToOut,
   type Clip,
   type PlacedClip,
 } from "../../lib/clips";
+import {
+  BUILTIN_PRESETS,
+  CAPTION_FONTS,
+  DEFAULT_CAPTION_BOX,
+  DEFAULT_CAPTION_STYLE,
+  defaultCaptionsState,
+  drawCaptions,
+  loadUserPresets,
+  pageAt,
+  pageText,
+  paginate,
+  replacePageText,
+  saveUserPresets,
+  wordsFromTranscript,
+  type CaptionAnim,
+  type CaptionBox,
+  type CaptionPreset,
+  type CaptionsState,
+  type CaptionStyle,
+  type HighlightMode,
+} from "../../lib/captions";
+import {
+  cameraCutAt,
+  defaultCameraCuts,
+  moveCameraCut,
+  splitCameraCut,
+  type CameraCut,
+} from "../../lib/cameraCuts";
+import {
+  isSilencedAt,
+  piecesOrDefault,
+  splitPiece,
+  type AudioPiece,
+} from "../../lib/audioPieces";
 import { ExportDialog } from "./ExportDialog";
 
 /**
@@ -83,13 +119,14 @@ function useSameOriginSrc(url: string | null): string | null {
     setBlobUrl(null);
     (async () => {
       try {
+        // Size-probe first: a plain GET ships the whole file in one IPC message and crashes WebKit past ~4 GB.
+        const probe = await fetch(url, { headers: { Range: "bytes=0-0" } });
+        if (!probe.ok) return;
+        await probe.arrayBuffer();
+        const len = Number(probe.headers.get("content-range")?.split("/")[1] || 0);
+        if (!len || len > BLOB_PREVIEW_MAX_BYTES) return;
         const res = await fetch(url);
         if (!res.ok) return;
-        const len = Number(res.headers.get("content-length") || 0);
-        if (len > BLOB_PREVIEW_MAX_BYTES) {
-          res.body?.cancel();
-          return;
-        }
         const blob = await res.blob();
         if (!alive) return;
         created = URL.createObjectURL(blob);
@@ -200,7 +237,10 @@ type AudioTrackState = {
   trimEnd: number;
   /** Studio-sound style auto leveling (peak-normalized at decode time). */
   normalize: boolean;
+  /** Split pieces; muted pieces are silent. Absent = one piece over the whole track. */
+  pieces?: AudioPiece[];
 };
+type AudioPieceSel = { key: AudioTrackKey; id: string } | null;
 
 type AudioTrackKey = "system" | "mic";
 
@@ -233,6 +273,8 @@ type CameraState = {
   shape: "circle" | "rounded";
   mirrored: boolean;
   keyframes: CameraKeyframe[];
+  /** Independent camera cuts; absent = one untouched cut over the whole camera clip. */
+  cuts?: CameraCut[];
 };
 
 const defaultCameraState = (): CameraState => ({
@@ -256,6 +298,7 @@ type EditorState = {
   clips: Clip[];
   audioTracks: Record<AudioTrackKey, AudioTrackState>;
   camera: CameraState;
+  captions: CaptionsState;
 };
 
 const ASPECT_ORDER: AspectKey[] = ["16:9", "1:1", "9:16", "system"];
@@ -1390,6 +1433,432 @@ function EffectSegmentPanel({
   );
 }
 
+type CaptionSource = { id: string; label: string; paths: string[] };
+
+const CAPTION_LANGUAGES: { id: string; label: string }[] = [
+  { id: "", label: "Auto-detect" },
+  { id: "de", label: "Deutsch" },
+  { id: "en", label: "English" },
+  { id: "es", label: "Español" },
+  { id: "fr", label: "Français" },
+  { id: "it", label: "Italiano" },
+  { id: "nl", label: "Nederlands" },
+  { id: "pl", label: "Polski" },
+  { id: "pt", label: "Português" },
+  { id: "tr", label: "Türkçe" },
+  { id: "ja", label: "日本語" },
+];
+
+const WHISPER_USD_PER_MIN = 0.006;
+
+/** Mini render of a caption style, drawn by the same renderer as the export. */
+function CaptionPresetThumb({ style }: { style: CaptionStyle }) {
+  const ref = useRef<HTMLCanvasElement | null>(null);
+  useEffect(() => {
+    const c = ref.current;
+    const ctx = c?.getContext("2d");
+    if (!c || !ctx) return;
+    const dpr = window.devicePixelRatio || 1;
+    c.width = 150 * dpr;
+    c.height = 64 * dpr;
+    ctx.clearRect(0, 0, c.width, c.height);
+    drawCaptions(ctx, {
+      outW: c.width,
+      outH: c.height,
+      tMs: 0,
+      sampleAtMs: 560,
+      captions: {
+        enabled: false,
+        words: [],
+        language: "",
+        style: { ...style, fontSize: Math.min(26, style.fontSize * 3.2), wordsPerPage: Math.min(3, style.wordsPerPage), animation: "none" },
+        box: { x: 0.5, y: 0.5, maxWidth: 0.95 },
+      },
+    });
+  }, [style]);
+  return <canvas ref={ref} className="cap-thumb" aria-hidden />;
+}
+
+function ColorField({ value, onChange, label }: { value: string; onChange: (v: string) => void; label: string }) {
+  return (
+    <label className="cap-color" title={label}>
+      <input type="color" value={value} onChange={(e) => onChange(e.target.value)} aria-label={label} />
+      <span>{label}</span>
+    </label>
+  );
+}
+
+function ToggleRow({ label, desc, on, onChange }: { label: string; desc?: string; on: boolean; onChange: (v: boolean) => void }) {
+  return (
+    <div className="row-toggle" style={{ marginTop: 14 }}>
+      <div className="col">
+        <div className="label">{label}</div>
+        {desc && <div className="desc">{desc}</div>}
+      </div>
+      <button className={`switch ${on ? "on" : ""}`} role="switch" aria-checked={on} aria-label={label} onClick={() => onChange(!on)} />
+    </div>
+  );
+}
+
+function SubtitlesPanel({
+  captions,
+  setCaptions,
+  sources,
+  srcDuration,
+  srcTime,
+  onSeekSrc,
+}: {
+  captions: CaptionsState;
+  setCaptions: (patch: Partial<CaptionsState>) => void;
+  sources: CaptionSource[];
+  srcDuration: number;
+  srcTime: number;
+  onSeekSrc: (t: number) => void;
+}) {
+  const [keyHint, setKeyHint] = useState<string | null>(null);
+  const [keyDraft, setKeyDraft] = useState("");
+  const [keyError, setKeyError] = useState<string | null>(null);
+  const [sourceId, setSourceId] = useState(sources[0]?.id ?? "");
+  const [language, setLanguage] = useState(() => localStorage.getItem("oss.captionLanguage") ?? "");
+  const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [userPresets, setUserPresets] = useState<CaptionPreset[]>(loadUserPresets);
+  const [presetName, setPresetName] = useState<string | null>(null);
+
+  useEffect(() => {
+    native.openaiKeyStatus().then(setKeyHint).catch(() => setKeyHint(null));
+  }, []);
+  useEffect(() => {
+    if (!sources.some((s) => s.id === sourceId)) setSourceId(sources[0]?.id ?? "");
+  }, [sources, sourceId]);
+
+  const st = captions.style;
+  const setStyle = (p: Partial<CaptionStyle>) => setCaptions({ style: { ...st, ...p } });
+  const setBox = (p: Partial<CaptionBox>) => setCaptions({ box: { ...captions.box, ...p } });
+  const pages = useMemo(() => paginate(captions.words, st.wordsPerPage), [captions.words, st.wordsPerPage]);
+  const hasWords = captions.words.length > 0;
+
+  const saveKey = async () => {
+    setKeyError(null);
+    try {
+      setKeyHint(await native.openaiKeySet(keyDraft));
+      setKeyDraft("");
+    } catch (e) {
+      setKeyError(String(e));
+    }
+  };
+
+  const generate = async () => {
+    const src = sources.find((s) => s.id === sourceId);
+    if (!src) return;
+    if (hasWords && !confirm("Replace the current transcript (including your edits)?")) return;
+    setBusy(true);
+    setError(null);
+    setProgress(null);
+    const off = await native.onTranscribeProgress(setProgress).catch(() => null);
+    try {
+      const t = await native.transcribeAudio(src.paths, language || null);
+      const words = wordsFromTranscript(t);
+      if (words.length === 0) setError("No speech was detected in this audio.");
+      setCaptions({ words, language: t.language, enabled: true });
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      off?.();
+      setBusy(false);
+      setProgress(null);
+    }
+  };
+
+  const savePreset = () => {
+    const name = (presetName ?? "").trim();
+    if (!name) return;
+    const next = [...userPresets, { id: `user-${Date.now().toString(36)}`, name, style: st }];
+    setUserPresets(next);
+    saveUserPresets(next);
+    setPresetName(null);
+  };
+  const deletePreset = (id: string) => {
+    const next = userPresets.filter((p) => p.id !== id);
+    setUserPresets(next);
+    saveUserPresets(next);
+  };
+  const sameStyle = (a: CaptionStyle) => JSON.stringify(a) === JSON.stringify(st);
+  const fmt = (ms: number) => fmtClock(ms / 1000);
+  const activePage = pageAt(pages, srcTime * 1000);
+
+  return (
+    <div className="section">
+      <h3 className="section-title">
+        <Ico.speech size={15} /> Subtitles
+      </h3>
+
+      {keyHint === null ? (
+        <div className="cap-card">
+          <div className="label-row label-strong" style={{ marginTop: 0 }}>Connect OpenAI</div>
+          <div className="helper-text" style={{ marginTop: 0, marginBottom: 8 }}>
+            Your API key is stored only on this Mac and used to transcribe with OpenAI Whisper.
+          </div>
+          <div className="cap-key-row">
+            <input
+              className="cap-input"
+              type="password"
+              placeholder="sk-…"
+              value={keyDraft}
+              onChange={(e) => setKeyDraft(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && void saveKey()}
+              spellCheck={false}
+              autoComplete="off"
+            />
+            <button className="cap-btn primary" disabled={!keyDraft.trim()} onClick={() => void saveKey()}>
+              Save
+            </button>
+          </div>
+          {keyError && <div className="cap-error">{keyError}</div>}
+        </div>
+      ) : (
+        <div className="cap-key-status">
+          <span><Ico.target size={11} /> OpenAI key <code>{keyHint}</code></span>
+          <button
+            className="reset"
+            onClick={() => void native.openaiKeyClear().then(() => setKeyHint(null))}
+          >
+            Remove
+          </button>
+        </div>
+      )}
+
+      <div className="label-row label-strong">Transcribe</div>
+      {sources.length === 0 ? (
+        <div className="helper-text">Record something with a microphone or system audio to generate subtitles.</div>
+      ) : (
+        <>
+          {sources.length > 1 && (
+            <div className="seg">
+              {sources.map((s) => (
+                <button key={s.id} className={sourceId === s.id ? "on" : ""} onClick={() => setSourceId(s.id)} disabled={busy}>
+                  {s.label}
+                </button>
+              ))}
+            </div>
+          )}
+          <select
+            className="cap-input"
+            value={language}
+            disabled={busy}
+            onChange={(e) => {
+              setLanguage(e.target.value);
+              localStorage.setItem("oss.captionLanguage", e.target.value);
+            }}
+          >
+            {CAPTION_LANGUAGES.map((l) => (
+              <option key={l.id} value={l.id}>{l.label}</option>
+            ))}
+          </select>
+          <button
+            className="cap-btn primary wide"
+            disabled={busy || keyHint === null}
+            onClick={() => void generate()}
+            style={{ marginTop: 8 }}
+          >
+            <Ico.sparkles size={13} />
+            {busy
+              ? progress && progress.total > 1
+                ? `Transcribing… ${progress.done}/${progress.total}`
+                : "Transcribing…"
+              : hasWords
+                ? "Regenerate subtitles"
+                : "Generate subtitles"}
+          </button>
+          <div className="helper-text">
+            whisper-1 · about ${Math.max(0.01, (srcDuration / 60) * WHISPER_USD_PER_MIN).toFixed(2)} for this recording
+          </div>
+          {error && <div className="cap-error">{error}</div>}
+        </>
+      )}
+
+      {hasWords && (
+        <ToggleRow label="Show subtitles" on={captions.enabled} onChange={(enabled) => setCaptions({ enabled })} />
+      )}
+
+      <div className="label-row label-strong" style={{ marginTop: 22 }}>Presets</div>
+      <div className="cap-presets">
+        {[...BUILTIN_PRESETS, ...userPresets].map((p) => (
+          <button
+            key={p.id}
+            className={`cap-preset ${sameStyle(p.style) ? "on" : ""}`}
+            onClick={() => setStyle(p.style)}
+            title={`Apply "${p.name}"`}
+          >
+            <CaptionPresetThumb style={p.style} />
+            <span className="name">{p.name}</span>
+            {p.id.startsWith("user-") && (
+              <span
+                className="del"
+                role="button"
+                aria-label={`Delete ${p.name}`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  deletePreset(p.id);
+                }}
+              >
+                ✕
+              </span>
+            )}
+          </button>
+        ))}
+      </div>
+      {presetName === null ? (
+        <button className="cap-btn wide" style={{ marginTop: 8 }} onClick={() => setPresetName("")}>
+          <Ico.plus size={12} /> Save current style as preset
+        </button>
+      ) : (
+        <div className="cap-key-row" style={{ marginTop: 8 }}>
+          <input
+            className="cap-input"
+            autoFocus
+            placeholder="Preset name"
+            value={presetName}
+            onChange={(e) => setPresetName(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") savePreset();
+              if (e.key === "Escape") setPresetName(null);
+            }}
+          />
+          <button className="cap-btn primary" disabled={!presetName.trim()} onClick={savePreset}>Save</button>
+        </div>
+      )}
+
+      <div className="label-row label-strong" style={{ marginTop: 22 }}>Text</div>
+      <select className="cap-input" value={st.font} onChange={(e) => setStyle({ font: e.target.value })}>
+        {CAPTION_FONTS.map((f) => (
+          <option key={f.id} value={f.id}>{f.label}</option>
+        ))}
+      </select>
+      <div className="seg" style={{ marginTop: 8 }}>
+        {[400, 600, 800, 900].map((w) => (
+          <button key={w} className={st.fontWeight === w ? "on" : ""} onClick={() => setStyle({ fontWeight: w })}>
+            {({ 400: "Regular", 600: "Semi", 800: "Bold", 900: "Black" } as Record<number, string>)[w]}
+          </button>
+        ))}
+      </div>
+      <div className="seg">
+        <button className={!st.uppercase ? "on" : ""} onClick={() => setStyle({ uppercase: false })}>Aa</button>
+        <button className={st.uppercase ? "on" : ""} onClick={() => setStyle({ uppercase: true })}>AA</button>
+      </div>
+      <div className="label-row">Size · {st.fontSize.toFixed(1)}%</div>
+      <Slider value={Math.round(st.fontSize * 10)} onChange={(v) => setStyle({ fontSize: v / 10 })} min={20} max={120} onReset={() => setStyle({ fontSize: DEFAULT_CAPTION_STYLE.fontSize })} />
+      <div className="cap-colors">
+        <ColorField label="Text" value={st.textColor} onChange={(textColor) => setStyle({ textColor })} />
+        <ColorField label="Outline" value={st.strokeColor} onChange={(strokeColor) => setStyle({ strokeColor })} />
+      </div>
+      <div className="label-row">Outline · {st.strokeWidth}%</div>
+      <Slider value={st.strokeWidth} onChange={(strokeWidth) => setStyle({ strokeWidth })} min={0} max={30} />
+      <div className="label-row">Shadow · {Math.round(st.shadow * 100)}%</div>
+      <Slider value={Math.round(st.shadow * 100)} onChange={(v) => setStyle({ shadow: v / 100 })} min={0} max={100} />
+
+      <div className="label-row label-strong" style={{ marginTop: 22 }}>Highlight active word</div>
+      <div className="seg">
+        {(["none", "color", "pill", "karaoke"] as HighlightMode[]).map((m) => (
+          <button key={m} className={st.highlight === m ? "on" : ""} onClick={() => setStyle({ highlight: m })}>
+            {{ none: "None", color: "Color", pill: "Pill", karaoke: "Karaoke" }[m]}
+          </button>
+        ))}
+      </div>
+      {st.highlight !== "none" && (
+        <div className="cap-colors">
+          <ColorField
+            label={st.highlight === "pill" ? "Pill" : "Highlight"}
+            value={st.highlightColor}
+            onChange={(highlightColor) => setStyle({ highlightColor })}
+          />
+          {st.highlight === "pill" && (
+            <ColorField label="Word" value={st.pillTextColor} onChange={(pillTextColor) => setStyle({ pillTextColor })} />
+          )}
+        </div>
+      )}
+      <ToggleRow label="Pop active word" desc="Briefly scales up the word being spoken." on={st.popActive} onChange={(popActive) => setStyle({ popActive })} />
+      <ToggleRow label="Reveal word by word" desc="Words appear only once they're spoken." on={st.revealWords} onChange={(revealWords) => setStyle({ revealWords })} />
+
+      <div className="label-row label-strong" style={{ marginTop: 22 }}>Background box</div>
+      <div className="seg">
+        <button className={!st.bgEnabled ? "on" : ""} onClick={() => setStyle({ bgEnabled: false })}>Off</button>
+        <button className={st.bgEnabled ? "on" : ""} onClick={() => setStyle({ bgEnabled: true })}>On</button>
+      </div>
+      {st.bgEnabled && (
+        <>
+          <div className="cap-colors">
+            <ColorField label="Box" value={st.bgColor} onChange={(bgColor) => setStyle({ bgColor })} />
+          </div>
+          <div className="label-row">Opacity · {Math.round(st.bgOpacity * 100)}%</div>
+          <Slider value={Math.round(st.bgOpacity * 100)} onChange={(v) => setStyle({ bgOpacity: v / 100 })} min={0} max={100} />
+        </>
+      )}
+
+      <div className="label-row label-strong" style={{ marginTop: 22 }}>Timing & animation</div>
+      <div className="label-row">Words on screen · {st.wordsPerPage}</div>
+      <Slider value={st.wordsPerPage} onChange={(wordsPerPage) => setStyle({ wordsPerPage })} min={1} max={10} />
+      <div className="seg" style={{ marginTop: 8 }}>
+        {(["none", "fade", "pop", "slide"] as CaptionAnim[]).map((a) => (
+          <button key={a} className={st.animation === a ? "on" : ""} onClick={() => setStyle({ animation: a })}>
+            {{ none: "None", fade: "Fade", pop: "Pop", slide: "Slide" }[a]}
+          </button>
+        ))}
+      </div>
+
+      <div className="label-row label-strong" style={{ marginTop: 22 }}>Position</div>
+      <div className="seg">
+        {([["Top", 0.14], ["Middle", 0.5], ["Bottom", 0.82]] as const).map(([l, y]) => (
+          <button key={l} className={Math.abs(captions.box.y - y) < 0.01 ? "on" : ""} onClick={() => setBox({ y, x: 0.5 })}>
+            {l}
+          </button>
+        ))}
+      </div>
+      <div className="label-row">Max width · {Math.round(captions.box.maxWidth * 100)}%</div>
+      <Slider value={Math.round(captions.box.maxWidth * 100)} onChange={(v) => setBox({ maxWidth: v / 100 })} min={20} max={100} onReset={() => setBox({ maxWidth: DEFAULT_CAPTION_BOX.maxWidth })} />
+      <div className="helper-text">Drag the subtitles in the preview to place them anywhere; drag the side handle to change the width.</div>
+
+      {hasWords && (
+        <>
+          <div className="label-row label-strong" style={{ marginTop: 22 }}>
+            Transcript · {captions.words.length} words
+          </div>
+          <div className="cap-transcript">
+            {pages.map((p) => {
+              const text = pageText(captions.words, p);
+              return (
+                <div key={`${p.from}-${text}`} className={`cap-line ${activePage === p ? "on" : ""}`}>
+                  <button className="time" onClick={() => onSeekSrc(p.startMs / 1000 + 0.001)}>
+                    {fmt(p.startMs)}
+                  </button>
+                  <input
+                    className="text"
+                    defaultValue={text}
+                    spellCheck
+                    onKeyDown={(e) => e.key === "Enter" && (e.target as HTMLInputElement).blur()}
+                    onBlur={(e) => {
+                      const v = e.target.value;
+                      if (v !== text) setCaptions({ words: replacePageText(captions.words, p, v) });
+                    }}
+                  />
+                  <button
+                    className="del"
+                    title="Delete line"
+                    onClick={() => setCaptions({ words: replacePageText(captions.words, p, "") })}
+                  >
+                    ✕
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 type ClipPanelProps = {
   clip: PlacedClip;
   index: number;
@@ -1483,8 +1952,8 @@ function ClipPanel({ clip, index, count, onPatch, onSplit, onDelete, onDuplicate
         Edit
       </div>
       <div className="clip-actions">
-        <button className="btn-wide" onClick={onSplit} title="Split at playhead (S)">
-          <Ico.scissors size={12} /> Split at playhead
+        <button className="btn-wide" onClick={onSplit} title="Split only this clip at the playhead (S)">
+          <Ico.scissors size={12} /> Split this clip
         </button>
         <button className="btn-wide" onClick={onDuplicate}>
           <Ico.copy size={12} /> Duplicate
@@ -1747,7 +2216,11 @@ function Inspector({
   selectedEffectSeg,
   onSelectEffect,
   clipPanel,
+  captionSources,
+  onSeekSrc,
 }: {
+  captionSources: CaptionSource[];
+  onSeekSrc: (t: number) => void;
   clipPanel: ClipPanelProps | null;
   active: string;
   state: EditorState;
@@ -1814,6 +2287,15 @@ function Inspector({
           onAddKeyframe={onCameraAddKeyframe}
           onClearKeyframes={onCameraClearKeyframes}
         />
+      ) : active === "subtitles" ? (
+        <SubtitlesPanel
+          captions={state.captions}
+          setCaptions={(p) => set({ captions: { ...state.captions, ...p } })}
+          sources={captionSources}
+          srcDuration={duration}
+          srcTime={currentTime}
+          onSeekSrc={onSeekSrc}
+        />
       ) : active === "effects" ? (
         <EffectsLibraryPanel
           effectSegments={effectSegments}
@@ -1841,7 +2323,7 @@ function IconRail({
     { id: "cursor", icon: <Ico.cursor size={17} /> },
     { id: "webcam", icon: <Ico.webcam size={17} /> },
     { id: "effects", icon: <Ico.sparkles size={17} /> },
-    { id: "subtitles", icon: <Ico.speech size={17} />, disabled: true },
+    { id: "subtitles", icon: <Ico.speech size={17} /> },
     { id: "audio", icon: <Ico.audio size={17} /> },
     { id: "shortcuts", icon: <Ico.cmd size={17} />, disabled: true },
     { id: "actions", icon: <Ico.link size={17} />, disabled: true },
@@ -1878,12 +2360,14 @@ function CameraOverlay({
   shape,
   mirrored,
   eff,
+  hidden,
   frameW,
   frameH,
   videoRef,
   onTransform,
   onSelect,
 }: {
+  hidden: boolean;
   src: string;
   shape: CameraState["shape"];
   mirrored: boolean;
@@ -1955,7 +2439,7 @@ function CameraOverlay({
   return (
     <div
       className={`camera-overlay ${shape}`}
-      style={{ left, top, width: box, height: box }}
+      style={{ left, top, width: box, height: box, visibility: hidden ? "hidden" : undefined }}
       onPointerDown={beginMove}
       title="Drag to move the camera"
     >
@@ -2004,10 +2488,17 @@ function Canvas({
   cameraSrc,
   camera,
   cameraEff,
+  cameraHidden,
   cameraVideoRef,
   onCameraTransform,
   onCameraSelect,
+  captions,
+  showCaptionGuide,
+  onCaptionBox,
 }: {
+  captions: CaptionsState;
+  showCaptionGuide: boolean;
+  onCaptionBox: (box: CaptionBox) => void;
   aspect: AspectKey;
   wallpaper: string;
   padding: number;
@@ -2025,6 +2516,7 @@ function Canvas({
   cameraSrc: string | null;
   camera: CameraState;
   cameraEff: { pos: { x: number; y: number }; size: number };
+  cameraHidden: boolean;
   cameraVideoRef: React.RefObject<HTMLVideoElement | null>;
   onCameraTransform: (p: { pos?: { x: number; y: number }; size?: number }) => void;
   onCameraSelect: () => void;
@@ -2355,6 +2847,74 @@ function Canvas({
     glActive,
   ]);
 
+  // Subtitles: frame-space canvas drawn by the same renderer as the export.
+  const capCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const capDragRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    let raf = 0;
+    let lastKey = "";
+    const showSample = showCaptionGuide && captions.words.length === 0;
+    const tick = () => {
+      raf = requestAnimationFrame(tick);
+      const cnv = capCanvasRef.current;
+      const ctx = cnv?.getContext("2d");
+      if (!cnv || !ctx) return;
+      const dpr = window.devicePixelRatio || 1;
+      const W = Math.max(1, Math.round(w * dpr));
+      const H = Math.max(1, Math.round(h * dpr));
+      const tMs = (videoRef.current?.currentTime ?? 0) * 1000;
+      const sampleAtMs = showSample ? performance.now() % 2400 : undefined;
+      const key = `${W}x${H}|${tMs}|${sampleAtMs ?? ""}`;
+      if (key === lastKey) return;
+      lastKey = key;
+      if (cnv.width !== W || cnv.height !== H) {
+        cnv.width = W;
+        cnv.height = H;
+      }
+      ctx.clearRect(0, 0, W, H);
+      const bb = drawCaptions(ctx, { outW: W, outH: H, tMs, captions, sampleAtMs });
+      const el = capDragRef.current;
+      if (el) {
+        const fb = (captions.style.fontSize / 100) * h * 1.22;
+        const r = bb
+          ? { x: bb.x / dpr, y: bb.y / dpr, w: bb.w / dpr, h: bb.h / dpr }
+          : { x: (captions.box.x - captions.box.maxWidth / 2) * w, y: captions.box.y * h - fb / 2, w: captions.box.maxWidth * w, h: fb };
+        el.style.transform = `translate(${r.x - 10}px, ${r.y - 6}px)`;
+        el.style.width = `${r.w + 20}px`;
+        el.style.height = `${r.h + 12}px`;
+      }
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [w, h, captions, showCaptionGuide, videoRef]);
+
+  const beginCaptionDrag = (mode: "move" | "width") => (e: React.PointerEvent) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const sx = e.clientX;
+    const sy = e.clientY;
+    const b0 = captions.box;
+    const move = (ev: PointerEvent) => {
+      const dx = ev.clientX - sx;
+      const dy = ev.clientY - sy;
+      if (mode === "width") {
+        onCaptionBox({ ...b0, maxWidth: Math.max(0.15, Math.min(1, b0.maxWidth + (2 * dx) / Math.max(1, w))) });
+        return;
+      }
+      let x = Math.max(0, Math.min(1, b0.x + dx / Math.max(1, w)));
+      if (Math.abs(x - 0.5) < 0.015) x = 0.5;
+      const y = Math.max(0, Math.min(1, b0.y + dy / Math.max(1, h)));
+      onCaptionBox({ ...b0, x, y });
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  };
+
   const wallpaperIsImage = isWallpaperImage(wallpaper);
   return (
     <div
@@ -2456,12 +3016,24 @@ function Canvas({
           shape={camera.shape}
           mirrored={camera.mirrored}
           eff={cameraEff}
+          hidden={cameraHidden}
           frameW={w}
           frameH={h}
           videoRef={cameraVideoRef}
           onTransform={onCameraTransform}
           onSelect={onCameraSelect}
         />
+      )}
+      <canvas ref={capCanvasRef} className="caption-layer" aria-hidden />
+      {showCaptionGuide && (
+        <div
+          ref={capDragRef}
+          className="caption-drag"
+          onPointerDown={beginCaptionDrag("move")}
+          title="Drag to move the subtitles"
+        >
+          <span className="caption-width" onPointerDown={beginCaptionDrag("width")} title="Drag to change the width" />
+        </div>
       )}
     </div>
   );
@@ -2532,14 +3104,17 @@ function Viewport({
   previewFps,
   cameraSrc,
   cameraEff,
+  cameraHidden,
   cameraVideoRef,
   onCameraTransform,
   onCameraSelect,
   onSplit,
+  showCaptionGuide,
 }: {
   state: EditorState;
   set: (p: StatePatch) => void;
   onSplit: () => void;
+  showCaptionGuide: boolean;
   onPlayToggle: () => void;
   onCrop: () => void;
   playing: boolean;
@@ -2556,6 +3131,7 @@ function Viewport({
   previewFps: number;
   cameraSrc: string | null;
   cameraEff: { pos: { x: number; y: number }; size: number };
+  cameraHidden: boolean;
   cameraVideoRef: React.RefObject<HTMLVideoElement | null>;
   onCameraTransform: (p: { pos?: { x: number; y: number }; size?: number }) => void;
   onCameraSelect: () => void;
@@ -2604,9 +3180,13 @@ function Viewport({
         cameraSrc={cameraSrc}
         camera={state.camera}
         cameraEff={cameraEff}
+        cameraHidden={cameraHidden}
         cameraVideoRef={cameraVideoRef}
         onCameraTransform={onCameraTransform}
         onCameraSelect={onCameraSelect}
+        captions={state.captions}
+        showCaptionGuide={showCaptionGuide}
+        onCaptionBox={(box) => set({ captions: { ...state.captions, box } })}
       />
       <div className="viewport-bottombar">
         <div className="left">
@@ -2667,7 +3247,7 @@ function Viewport({
         <div className="right">
           <button
             className="transport-btn"
-            title="Split clip at playhead (S)"
+            title="Split all tracks at playhead (S). Select a clip first to split only that one."
             onClick={onSplit}
           >
             <Ico.scissors size={16} />
@@ -2943,7 +3523,11 @@ function AudioTrackRow({
   selected,
   onSelect,
   onChange,
+  selectedPieceId,
+  onSelectPiece,
 }: {
+  selectedPieceId: string | null;
+  onSelectPiece: (id: string) => void;
   info: AudioRowInfo;
   total: number;
   clips: PlacedClip[];
@@ -3014,6 +3598,7 @@ function AudioTrackRow({
     ...(track.trimStart > 0 ? srcRangePieces(clips, 0, track.trimStart) : []),
     ...(track.trimEnd > 0 ? srcRangePieces(clips, trimEndSrc, srcTotal) : []),
   ];
+  const pieces = piecesOrDefault(track.pieces, srcTotal);
 
   return (
     <div
@@ -3045,6 +3630,25 @@ function AudioTrackRow({
             }}
           />
         ))}
+        {pieces.flatMap((p) =>
+          srcRangePieces(clips, p.start, p.end).map((pc) => (
+            <div
+              key={`${p.id}-${pc.clip.id}`}
+              className={`audio-piece ${p.muted ? "silenced" : ""} ${selectedPieceId === p.id ? "selected" : ""}`}
+              style={{
+                left: `${(pc.outStart / total) * 100}%`,
+                width: `${((pc.outEnd - pc.outStart) / total) * 100}%`,
+              }}
+              onMouseDown={(e) => {
+                e.stopPropagation();
+                onSelectPiece(p.id);
+              }}
+              title={p.muted ? "Silenced. ⌫ restores the sound" : "S splits this audio, ⌫ silences it"}
+            >
+              {p.muted && <Ico.audioMuted size={11} />}
+            </div>
+          )),
+        )}
         <button
           className="audio-mute"
           onMouseDown={(e) => e.stopPropagation()}
@@ -3094,6 +3698,8 @@ function Timeline({
   onAudioTrack,
   selectedAudioKey,
   setSelectedAudioKey,
+  audioPieceSel,
+  onAudioPiece,
   cameraRow,
   onSelectCamera,
   onRemoveCameraKeyframe,
@@ -3107,7 +3713,11 @@ function Timeline({
   selectedEffectId,
   setSelectedEffectId,
   onHover,
+  captionPages,
+  onCaptionPage,
 }: {
+  captionPages: { startMs: number; endMs: number; text: string }[];
+  onCaptionPage: (outT: number) => void;
   duration: number;
   currentTime: number;
   setCurrentTime: (v: number) => void;
@@ -3126,11 +3736,17 @@ function Timeline({
   onAudioTrack: (key: AudioTrackKey, patch: Partial<AudioTrackState>) => void;
   selectedAudioKey: AudioTrackKey | null;
   setSelectedAudioKey: (key: AudioTrackKey | null) => void;
+  audioPieceSel: AudioPieceSel;
+  onAudioPiece: (sel: AudioPieceSel) => void;
   cameraRow: {
     offset: number;
     duration: number;
     keyframes: CameraKeyframe[];
     enabled: boolean;
+    cuts: CameraCut[];
+    selectedCutId: string | null;
+    onSelectCut: (id: string | null) => void;
+    onCuts: (next: CameraCut[]) => void;
   } | null;
   onSelectCamera: () => void;
   onRemoveCameraKeyframe: (t: number) => void;
@@ -3197,10 +3813,37 @@ function Timeline({
     setCurrentTime(Math.max(0, Math.min(TOTAL, t)));
   };
 
+  const srcAtX = (clientX: number) => {
+    const r = ref.current!.getBoundingClientRect();
+    const o = Math.max(0, Math.min(TOTAL, ((clientX - r.left - LEFT_INSET) / Math.max(1, r.width - INSET_TOTAL)) * TOTAL));
+    return outToSrc(clips[clipIndexAtOut(clips, o)], o);
+  };
+  // Drag a camera cut: slides its window and content together (resyncs the camera).
+  const beginCamCutDrag = (id: string) => (e: React.MouseEvent) => {
+    if (!cameraRow || e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    cameraRow.onSelectCut(id);
+    onSelectCamera();
+    const orig = cameraRow.cuts;
+    const s0 = srcAtX(e.clientX);
+    const move = (ev: MouseEvent) =>
+      cameraRow.onCuts(moveCameraCut(orig, id, Math.round((srcAtX(ev.clientX) - s0) * 30) / 30, srcDuration));
+    const up = () => {
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", up);
+    };
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
+  };
+
   const beginDrag = (e: React.MouseEvent) => {
     e.preventDefault();
     setSelectedZoomId(null);
     setSelectedEffectId(null);
+    onSelectClip(null);
+    cameraRow?.onSelectCut(null);
+    onAudioPiece(null);
     if (hoverT !== null) {
       setHoverT(null);
       onHover?.(null);
@@ -3534,6 +4177,11 @@ function Timeline({
           <div className="tl-gutter-row clip">
             <Ico.film size={12} />
           </div>
+          {captionPages.length > 0 && (
+            <div className="tl-gutter-row captions">
+              <Ico.speech size={12} />
+            </div>
+          )}
           {cameraRow && (
             <div className="tl-gutter-row camera">
               <Ico.webcam size={12} />
@@ -3629,31 +4277,55 @@ function Timeline({
           )}
         </div>
 
+        {captionPages.length > 0 && (
+          <div className="tl-track captions">
+            {captionPages.flatMap((pg, i) =>
+              srcRangePieces(clips, pg.startMs / 1000, pg.endMs / 1000).map((pc) => (
+                <div
+                  key={`${i}-${pc.clip.id}`}
+                  className="caption-chip"
+                  style={{ left: `${pctOf(pc.outStart)}%`, width: `${pctOf(pc.outEnd - pc.outStart)}%` }}
+                  title={pg.text}
+                  onMouseDown={(e) => {
+                    e.stopPropagation();
+                    onCaptionPage(pc.outStart);
+                  }}
+                >
+                  {pg.text}
+                </div>
+              )),
+            )}
+          </div>
+        )}
+
         {cameraRow && (() => {
           // Camera clip span on the shared timeline (clamped). A zero
           // duration (metadata not loaded yet / bubble hidden) falls back to
           // the full remaining range so the row never vanishes.
-          const start = Math.max(0, cameraRow.offset);
-          const rawEnd = cameraRow.duration > 0 ? cameraRow.offset + cameraRow.duration : srcDuration;
-          const pieces = srcRangePieces(clips, start, Math.max(start, rawEnd));
+          const pieces = cameraRow.cuts.flatMap((cut) =>
+            srcRangePieces(clips, cut.start, Math.max(cut.start, cut.end)).map((pc) => ({ cut, pc })),
+          );
           return (
             <div className="tl-track camera" style={{ position: "relative" }}>
-              {pieces.map((pc) => (
+              {pieces.map(({ cut, pc }) => (
                 <div
-                  key={pc.clip.id}
-                  className={`camera-track-block ${cameraRow.enabled ? "" : "off"}`}
+                  key={`${cut.id}-${pc.clip.id}`}
+                  className={`camera-track-block ${cameraRow.enabled ? "" : "off"} ${
+                    cameraRow.selectedCutId === cut.id ? "selected" : ""
+                  }`}
                   style={{
                     left: `${pctOf(pc.outStart)}%`,
                     width: `${pctOf(Math.max(0.01, pc.outEnd - pc.outStart))}%`,
                   }}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onSelectCamera();
-                  }}
-                  title={cameraRow.enabled ? "Camera track" : "Camera hidden"}
+                  onMouseDown={beginCamCutDrag(cut.id)}
+                  onClick={(e) => e.stopPropagation()}
+                  title="Camera · click to select, S to cut, drag to shift, ⌥←/→ to nudge by a frame, ⌫ to remove"
                 >
                   <Ico.webcam size={11} />
-                  <span>Camera</span>
+                  <span>
+                    Camera
+                    {Math.abs(cut.shift) >= 0.005 && ` ${cut.shift > 0 ? "+" : ""}${cut.shift.toFixed(2)}s`}
+                  </span>
                 </div>
               ))}
               {cameraRow.keyframes.flatMap((kf) =>
@@ -3692,6 +4364,8 @@ function Timeline({
             selected={selectedAudioKey === row.key}
             onSelect={() => setSelectedAudioKey(row.key)}
             onChange={(patch) => onAudioTrack(row.key, patch)}
+            selectedPieceId={audioPieceSel?.key === row.key ? audioPieceSel.id : null}
+            onSelectPiece={(id) => onAudioPiece({ key: row.key, id })}
           />
         ))}
 
@@ -4062,8 +4736,15 @@ export function Editor({
     clips: [],
     audioTracks: defaultAudioTracks(),
     camera: defaultCameraState(),
+    captions: defaultCaptionsState(),
   });
   const set = (patch: StatePatch) => setState((s) => ({ ...s, ...patch }));
+  const audioPiecesOf = (key: AudioTrackKey) => piecesOrDefault(state.audioTracks[key].pieces, srcDuration);
+  const toggleAudioPieceRef = useRef((_sel: NonNullable<AudioPieceSel>) => {});
+  toggleAudioPieceRef.current = (sel) =>
+    setAudioTrack(sel.key, {
+      pieces: audioPiecesOf(sel.key).map((p) => (p.id === sel.id ? { ...p, muted: !p.muted } : p)),
+    });
   const setAudioTrack = (key: AudioTrackKey, patch: Partial<AudioTrackState>) =>
     setState((s) => ({
       ...s,
@@ -4094,6 +4775,8 @@ export function Editor({
   const [effectSegments, setEffectSegments] = useState<EffectSegment[]>([]);
   const [selectedEffectId, setSelectedEffectId] = useState<string | null>(null);
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
+  const [selectedCamCutId, setSelectedCamCutId] = useState<string | null>(null);
+  const [audioPieceSel, setAudioPieceSel] = useState<AudioPieceSel>(null);
   const selectedEffectSeg = useMemo(
     () => findEffectSegment(effectSegments, selectedEffectId),
     [effectSegments, selectedEffectId],
@@ -4208,10 +4891,12 @@ export function Editor({
         setSelectedZoomId(null);
         setSelectedEffectId(null);
         setSelectedClipId(null);
+        setSelectedCamCutId(null);
+        setAudioPieceSel(null);
         return;
       }
       if (e.key !== "Delete" && e.key !== "Backspace") return;
-      if (!selectedZoomId && !selectedEffectId && !selectedClipId) return;
+      if (!selectedZoomId && !selectedEffectId && !selectedClipId && !selectedCamCutId && !audioPieceSel) return;
       const t = e.target as HTMLElement | null;
       if (
         t &&
@@ -4233,10 +4918,15 @@ export function Editor({
       if (selectedClipId && !selectedZoomId && !selectedEffectId) {
         deleteClipRef.current(selectedClipId);
       }
+      if (selectedCamCutId) {
+        setCamCuts(camCutsRef.current.filter((c) => c.id !== selectedCamCutId));
+        setSelectedCamCutId(null);
+      }
+      if (audioPieceSel && !selectedClipId) toggleAudioPieceRef.current(audioPieceSel);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [selectedZoomId, zoomSegments, setZoomSegments, selectedEffectId, effectSegments, setEffectSegments, selectedClipId]);
+  }, [selectedZoomId, zoomSegments, setZoomSegments, selectedEffectId, effectSegments, setEffectSegments, selectedClipId, selectedCamCutId, audioPieceSel]);
 
   // When a segment is selected, highlight the matching rail icon.
   useEffect(() => {
@@ -4341,6 +5031,13 @@ export function Editor({
   }, [placed, currentTime]);
   const srcTimeRef = useRef(srcTime);
   srcTimeRef.current = srcTime;
+  const camCuts = useMemo(
+    () => state.camera.cuts ?? defaultCameraCuts((artifact?.cameraOffsetMs ?? 0) / 1000, cameraDuration, srcDuration),
+    [state.camera.cuts, artifact?.cameraOffsetMs, cameraDuration, srcDuration],
+  );
+  const camCutsRef = useRef(camCuts);
+  camCutsRef.current = camCuts;
+  const setCamCuts = (cuts: CameraCut[]) => setState((s) => ({ ...s, camera: { ...s.camera, cuts } }));
   const [playing, setPlaying] = useState(false);
   const [cropOpen, setCropOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
@@ -4437,6 +5134,7 @@ export function Editor({
         clips: [],
         audioTracks: defaultAudioTracks(),
         camera: defaultCameraState(),
+        captions: { ...s.captions, words: [], language: "" },
       }));
       pendingLegacyTrimRef.current = null;
       setSelectedClipId(null);
@@ -4538,12 +5236,8 @@ export function Editor({
     };
   }, [micAudioSrc]);
 
-  // ---- Sidecar audio playback (Web Audio) --------------------------------
-  // The screen <video> is the master clock (muted — the sidecar tracks own
-  // all audio). Each track plays its decoded buffer through a GainNode;
-  // play/seek (re)starts an AudioBufferSourceNode at the video's time, and a
-  // rAF watcher applies mute/trim/gain and restarts a source if it drifts.
-  // The tracks' editable state rides a ref so the loop is subscription-free.
+  // ---- Sidecar audio playback (native, see preview_audio.rs) -------------
+  // The muted screen <video> is the master clock; a rAF loop pushes gains and resyncs on drift.
   // Auto-level multipliers, recomputed when a sidecar buffer decodes.
   const systemAutoGain = useMemo(
     () => (systemBuf ? autoLevelGain(systemBuf) : 1),
@@ -4556,96 +5250,74 @@ export function Editor({
 
   const audioSyncRef = useRef({
     tracks: state.audioTracks,
-    duration,
+    duration: srcDuration,
     auto: { system: 1, mic: 1 },
   });
   audioSyncRef.current = {
     tracks: state.audioTracks,
-    duration,
+    duration: srcDuration,
     auto: { system: systemAutoGain, mic: micAutoGain },
   };
 
   useEffect(() => {
     const v = videoRef.current;
     if (!v) return;
-    const bufs: { key: AudioTrackKey; buf: AudioBuffer }[] = [];
-    if (systemBuf) bufs.push({ key: "system", buf: systemBuf });
-    if (micBuf) bufs.push({ key: "mic", buf: micBuf });
     v.muted = hasSidecarAudio;
-    if (bufs.length === 0) return;
+    const tracks = (
+      [
+        ["system", artifact?.systemAudioPath],
+        ["mic", artifact?.micPath],
+      ] as [AudioTrackKey, string | null | undefined][]
+    ).filter((x): x is [AudioTrackKey, string] => !!x[1]);
+    if (tracks.length === 0) return;
 
-    const ctx = getAudioCtx();
-    const nodes = bufs.map(({ key, buf }) => {
-      const gain = ctx.createGain();
-      gain.gain.value = 0; // ramped by the rAF below
-      gain.connect(ctx.destination);
-      return {
-        key,
-        buf,
-        gain,
-        src: null as AudioBufferSourceNode | null,
-        startCtxT: 0,
-        startOffset: 0,
-        rate: 1,
-      };
-    });
-    type Node = (typeof nodes)[number];
-
-    const stopNode = (n: Node) => {
-      if (!n.src) return;
-      try {
-        n.src.stop();
-      } catch {}
-      n.src.disconnect();
-      n.src = null;
-    };
+    let alive = true;
+    let ready = false;
+    let sentRate = 1;
+    let lastGains = "";
+    let lastCheck = 0;
     const clipRate = () => placedRef.current[playIdxRef.current]?.speed ?? 1;
-    const startNode = (n: Node, t: number) => {
-      stopNode(n);
-      if (t >= n.buf.duration) return; // past the end of this track
-      const src = ctx.createBufferSource();
-      src.buffer = n.buf;
-      n.rate = clipRate();
-      src.playbackRate.value = n.rate;
-      src.connect(n.gain);
-      src.start(0, Math.max(0, t));
-      n.src = src;
-      n.startCtxT = ctx.currentTime;
-      n.startOffset = Math.max(0, t);
+    const sync = () => {
+      if (!ready) return;
+      sentRate = clipRate();
+      void native.previewAudioSet(!v.paused, v.currentTime, sentRate);
     };
-    const startAll = () => {
-      void ctx.resume().catch(() => {});
-      for (const n of nodes) startNode(n, v.currentTime);
-    };
-    const stopAll = () => {
-      for (const n of nodes) stopNode(n);
-    };
-
-    const onPlay = () => startAll();
-    const onPause = () => stopAll();
-    const onSeeked = () => {
-      if (!v.paused) startAll();
-    };
-    v.addEventListener("play", onPlay);
-    v.addEventListener("pause", onPause);
-    v.addEventListener("seeked", onSeeked);
-    if (!v.paused) startAll();
+    native
+      .previewAudioLoad(tracks.map((t) => t[1]))
+      .then(() => {
+        if (!alive) return;
+        ready = true;
+        lastGains = "";
+        sync();
+      })
+      .catch((e) => console.error("preview audio", e));
+    v.addEventListener("play", sync);
+    v.addEventListener("pause", sync);
+    v.addEventListener("seeked", sync);
 
     let raf = 0;
-    const tick = () => {
-      const { tracks, duration: dur, auto } = audioSyncRef.current;
+    const tick = (now: number) => {
+      const { tracks: ts, duration: dur, auto } = audioSyncRef.current;
       const t = v.currentTime;
       const clip = placedRef.current[playIdxRef.current];
-      const rate = clip?.speed ?? 1;
-      for (const n of nodes) {
-        const ts = tracks[n.key];
-        const inWindow = t >= ts.trimStart - 1e-3 && t <= dur - ts.trimEnd + 1e-3;
-        const boost = ts.normalize ? auto[n.key] : 1;
-        n.gain.gain.value =
-          ts.muted || clip?.muted || !inWindow ? 0 : Math.max(0, Math.min(1, ts.gain)) * boost;
-        if (!v.paused && n.src) {
-          const expected = n.startOffset + (ctx.currentTime - n.startCtxT) * n.rate;
-          if (n.rate !== rate || Math.abs(expected - t) > 0.12 * Math.max(1, rate)) startNode(n, t);
+      const gains = tracks.map(([key]) => {
+        const tr = ts[key];
+        const inWindow = t >= tr.trimStart - 1e-3 && t <= dur - tr.trimEnd + 1e-3;
+        const boost = tr.normalize ? auto[key] : 1;
+        return tr.muted || clip?.muted || !inWindow || isSilencedAt(tr.pieces, t) ? 0 : Math.max(0, Math.min(1, tr.gain)) * boost;
+      });
+      const key = gains.join(",");
+      if (ready && key !== lastGains) {
+        lastGains = key;
+        void native.previewAudioGains(gains);
+      }
+      if (ready && !v.paused) {
+        if (clipRate() !== sentRate) sync();
+        else if (now - lastCheck > 500) {
+          lastCheck = now;
+          void native.previewAudioPos().then((p) => {
+            if (alive && !v.paused && Math.abs(p - v.currentTime) > 0.12 * Math.max(1, sentRate)) sync();
+          });
         }
       }
       raf = requestAnimationFrame(tick);
@@ -4653,15 +5325,15 @@ export function Editor({
     raf = requestAnimationFrame(tick);
 
     return () => {
-      v.removeEventListener("play", onPlay);
-      v.removeEventListener("pause", onPause);
-      v.removeEventListener("seeked", onSeeked);
+      alive = false;
+      v.removeEventListener("play", sync);
+      v.removeEventListener("pause", sync);
+      v.removeEventListener("seeked", sync);
       cancelAnimationFrame(raf);
-      stopAll();
-      for (const n of nodes) n.gain.disconnect();
+      void native.previewAudioSet(false, 0, 1);
       v.muted = false;
     };
-  }, [videoSrc, systemBuf, micBuf, hasSidecarAudio]);
+  }, [videoSrc, artifact?.systemAudioPath, artifact?.micPath, hasSidecarAudio]);
 
   // Slave the camera preview <video> to the master clock, shifted by the
   // recorded camera start offset.
@@ -4670,7 +5342,8 @@ export function Editor({
     const c = cameraVideoRef.current;
     if (!v || !c || !cameraSrc) return;
     const offset = (artifact?.cameraOffsetMs ?? 0) / 1000;
-    const camTime = () => Math.max(0, v.currentTime - offset);
+    const camTime = () =>
+      Math.max(0, v.currentTime - offset - (cameraCutAt(camCutsRef.current, v.currentTime)?.shift ?? 0));
     const syncTime = () => {
       try {
         c.currentTime = camTime();
@@ -4744,7 +5417,7 @@ export function Editor({
     playIdxRef.current = i;
     const t = outToSrc(pl[i], o);
     if (Math.abs(v.currentTime - t) > 0.05) v.currentTime = t;
-    v.playbackRate = pl[i].speed;
+    v.playbackRate = Math.min(pl[i].speed, NATIVE_RATE_MAX);
     v.play().catch(() => {});
   }, [playing, videoSrc]);
 
@@ -4784,12 +5457,18 @@ export function Editor({
       return () => v.removeEventListener("timeupdate", onTime);
     }
     let raf = 0;
+    let last = performance.now();
+    let fastT: number | null = null;
     const tick = () => {
+      const now = performance.now();
+      const dt = Math.min(0.1, (now - last) / 1000);
+      last = now;
       if (!isHoveringRef.current) {
         const pl = placedRef.current;
         let i = Math.min(playIdxRef.current, pl.length - 1);
         let c = pl[i];
-        if (v.ended || v.currentTime >= c.srcEnd - 0.02 * c.speed) {
+        const t = fastT ?? v.currentTime;
+        if (v.ended || t >= c.srcEnd - 0.02 * Math.min(c.speed, NATIVE_RATE_MAX)) {
           if (i + 1 >= pl.length) {
             setPlaying(false);
             setCurrentTime(outDuration(pl));
@@ -4799,11 +5478,20 @@ export function Editor({
           c = pl[i];
           playIdxRef.current = i;
           // Contiguous clips (a plain split) continue without a seek hitch.
+          fastT = null;
           if (Math.abs(v.currentTime - c.srcStart) > 0.06) v.currentTime = c.srcStart;
-          if (v.paused) v.play().catch(() => {});
         }
-        if (v.playbackRate !== c.speed) v.playbackRate = c.speed;
-        setCurrentTime(srcToOut(c, v.currentTime));
+        if (c.speed > NATIVE_RATE_MAX) {
+          if (!v.paused) v.pause();
+          fastT = Math.min(c.srcEnd, (fastT ?? v.currentTime) + dt * c.speed);
+          if (!v.seeking) v.currentTime = fastT;
+          setCurrentTime(srcToOut(c, fastT));
+        } else {
+          fastT = null;
+          if (v.paused) v.play().catch(() => {});
+          if (v.playbackRate !== c.speed) v.playbackRate = c.speed;
+          setCurrentTime(srcToOut(c, v.currentTime));
+        }
       }
       raf = requestAnimationFrame(tick);
     };
@@ -4821,7 +5509,7 @@ export function Editor({
     const v = videoRef.current;
     if (v && videoSrc && pl[i]) {
       v.currentTime = outToSrc(pl[i], o);
-      v.playbackRate = pl[i].speed;
+      v.playbackRate = Math.min(pl[i].speed, NATIVE_RATE_MAX);
     }
   };
 
@@ -4847,6 +5535,8 @@ export function Editor({
       if (e.key === " " || e.code === "Space") {
         e.preventDefault();
         setPlaying((p) => !p);
+      } else if (e.altKey && (e.key === "ArrowLeft" || e.key === "ArrowRight") && nudgeCamRef.current(e.key === "ArrowLeft" ? -1 : 1)) {
+        e.preventDefault();
       } else if (e.key === "ArrowLeft") {
         e.preventDefault();
         setPlaying(false);
@@ -4916,17 +5606,62 @@ export function Editor({
   const selectClip = (id: string | null) => {
     setSelectedClipId(id);
     if (id) {
+      setSelectedCamCutId(null);
       setSelectedZoomId(null);
       setSelectedEffectId(null);
       setSelectedAudioKey(null);
+      setAudioPieceSel(null);
     }
   };
+  // CapCut-style: a selected block splits alone; with nothing selected every track splits at the playhead.
   const splitAtPlayhead = () => {
-    const r = splitAt(effClips, currentTimeRef.current);
-    if (!r) return;
-    setClips(r.clips);
-    selectClip(r.rightId);
+    const tMs = srcTimeRef.current * 1000;
+    if (audioPieceSel) {
+      const r = splitPiece(audioPiecesOf(audioPieceSel.key), srcTimeRef.current, audioPieceSel.id);
+      if (r) {
+        setAudioTrack(audioPieceSel.key, { pieces: r.pieces });
+        setAudioPieceSel({ key: audioPieceSel.key, id: r.rightId });
+      }
+      return;
+    }
+    if (selectedCamCutId) {
+      const r = splitCameraCut(camCuts, srcTimeRef.current, selectedCamCutId);
+      if (r) {
+        setCamCuts(r.cuts);
+        setSelectedCamCutId(r.rightId);
+      }
+      return;
+    }
+    if (selectedZoomId) return setZoomSegments(splitSegmentsAt(zoomSegments, tMs, selectedZoomId));
+    if (selectedEffectId) return setEffectSegments(splitSegmentsAt(effectSegments, tMs, selectedEffectId));
+    const r = splitAt(effClips, currentTimeRef.current, selectedClipId ?? undefined);
+    if (r) setClips(r.clips);
+    if (selectedClipId) {
+      if (r) selectClip(r.rightId);
+      return;
+    }
+    setZoomSegments(splitSegmentsAt(zoomSegments, tMs));
+    setEffectSegments(splitSegmentsAt(effectSegments, tMs));
+    const rc = cameraSrc ? splitCameraCut(camCuts, srcTimeRef.current) : null;
+    if (rc) setCamCuts(rc.cuts);
+    for (const row of audioRows) {
+      const ra = splitPiece(audioPiecesOf(row.key), srcTimeRef.current);
+      if (ra) setAudioTrack(row.key, { pieces: ra.pieces });
+    }
   };
+  const nudgeCamRef = useRef<(dir: number) => boolean>(() => false);
+  nudgeCamRef.current = (dir) => {
+    if (!selectedCamCutId) return false;
+    setCamCuts(moveCameraCut(camCuts, selectedCamCutId, dir / 30, srcDuration));
+    return true;
+  };
+  useEffect(() => {
+    if (selectedZoomId || selectedEffectId) {
+      setSelectedClipId(null);
+      setSelectedCamCutId(null);
+      setAudioPieceSel(null);
+    }
+  }, [selectedZoomId, selectedEffectId]);
   const deleteClip = (id: string) => {
     if (effClips.length <= 1) return;
     setClips(removeClip(effClips, id));
@@ -5020,6 +5755,11 @@ export function Editor({
       camera: editorState.camera
         ? { ...defaultCameraState(), ...editorState.camera }
         : defaultCameraState(),
+      captions: {
+        ...defaultCaptionsState(),
+        ...(editorState.captions ?? {}),
+        style: { ...DEFAULT_CAPTION_STYLE, ...(editorState.captions?.style ?? {}) },
+      },
     }));
     setSelectedAudioKey(null);
     setSelectedClipId(null);
@@ -5053,6 +5793,41 @@ export function Editor({
     return rows;
   }, [systemAudioSrc, micAudioSrc, systemPeaks, micPeaks, state.audioTracks, systemAutoGain, micAutoGain]);
 
+  const captionSources = useMemo<CaptionSource[]>(() => {
+    if (!artifact) return [];
+    const mic = artifact.micPath;
+    const sys = artifact.systemAudioPath;
+    const out: CaptionSource[] = [];
+    if (mic) out.push({ id: "mic", label: "Microphone", paths: [mic] });
+    if (sys) out.push({ id: "system", label: "System audio", paths: [sys] });
+    if (mic && sys) out.push({ id: "both", label: "Both", paths: [mic, sys] });
+    if (!mic && !sys) out.push({ id: "recording", label: "Recording", paths: [artifact.path] });
+    return out;
+  }, [artifact]);
+
+  const seekToSrc = (t: number) => {
+    const c = placedRef.current.find((k) => t >= k.srcStart && t <= k.srcEnd);
+    if (c) seek(srcToOut(c, t));
+  };
+
+  const captionPages = useMemo(() => {
+    const { words, style, enabled } = state.captions;
+    if (!enabled) return [];
+    return paginate(words, style.wordsPerPage).map((p) => ({
+      startMs: p.startMs,
+      endMs: p.endMs,
+      text: pageText(words, p),
+    }));
+  }, [state.captions]);
+
+  const selectAudioPiece = (sel: AudioPieceSel) => {
+    setAudioPieceSel(sel);
+    if (sel) {
+      selectAudioTrack(sel.key);
+      setSelectedEffectId(null);
+      setSelectedCamCutId(null);
+    }
+  };
   const selectAudioTrack = (key: AudioTrackKey | null) => {
     setSelectedAudioKey(key);
     if (key) {
@@ -5070,6 +5845,7 @@ export function Editor({
     () => cameraAt(state.camera, srcTime),
     [state.camera, srcTime],
   );
+  const activeCamCut = cameraCutAt(camCuts, srcTime);
 
   const KF_EPS = 0.05; // keyframes closer than this (s) are replaced, not added
 
@@ -5228,10 +6004,12 @@ export function Editor({
           previewFps={previewFpsFor(perfSettings)}
           cameraSrc={cameraSrc}
           cameraEff={cameraEff}
+          cameraHidden={!activeCamCut}
           cameraVideoRef={cameraVideoRef}
           onCameraTransform={handleCameraTransform}
           onCameraSelect={selectCamera}
           onSplit={splitAtPlayhead}
+          showCaptionGuide={activeRail === "subtitles" && !selectedClip && !selectedSeg && !selectedEffectSeg}
         />
         <IconRail active={activeRail} setActive={setActiveRail} />
         <Inspector
@@ -5276,6 +6054,8 @@ export function Editor({
           setEffectSegments={setEffectSegments}
           selectedEffectSeg={selectedEffectSeg}
           onSelectEffect={setSelectedEffectId}
+          captionSources={captionSources}
+          onSeekSrc={seekToSrc}
         />
         <div
           className="inspector-resizer"
@@ -5307,6 +6087,8 @@ export function Editor({
         onAudioTrack={setAudioTrack}
         selectedAudioKey={selectedAudioKey}
         setSelectedAudioKey={selectAudioTrack}
+        audioPieceSel={audioPieceSel}
+        onAudioPiece={selectAudioPiece}
         cameraRow={
           cameraSrc
             ? {
@@ -5314,6 +6096,10 @@ export function Editor({
                 duration: cameraDuration,
                 keyframes: state.camera.keyframes,
                 enabled: state.camera.enabled,
+                cuts: camCuts,
+                selectedCutId: selectedCamCutId,
+                onSelectCut: setSelectedCamCutId,
+                onCuts: setCamCuts,
               }
             : null
         }
@@ -5329,6 +6115,14 @@ export function Editor({
         selectedEffectId={selectedEffectId}
         setSelectedEffectId={setSelectedEffectId}
         onHover={handleTimelineHover}
+        captionPages={captionPages}
+        onCaptionPage={(t) => {
+          seek(t);
+          setActiveRail("subtitles");
+          setSelectedClipId(null);
+          setSelectedZoomId(null);
+          setSelectedEffectId(null);
+        }}
       />
       {cropOpen && (
         <CropDialog
@@ -5367,6 +6161,7 @@ export function Editor({
               Math.min(1, zoomSettings.smoothing / 100),
             )}
             effectSegments={effectSegments}
+            captions={state.captions}
             clips={placed}
             audioTracks={[
               ...(artifact.systemAudioPath
@@ -5397,6 +6192,7 @@ export function Editor({
                     path: artifact.cameraPath,
                     offsetMs: artifact.cameraOffsetMs ?? 0,
                     ...state.camera,
+                    cuts: camCuts,
                   }
                 : null
             }
